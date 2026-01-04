@@ -2,198 +2,170 @@ import json
 import logging
 import urllib.request
 import urllib.parse
-import sqlite3
 import time
 import ssl
+import threading
 
 # --- CONFIGURATION ---
 API_TOKEN = '8278293381:AAHpnS4M6txEuChRjjLY_vgZUt6ey14NMhM'
 ADMIN_IDS = [103161998, 37607526]
-DB_FILE = "village_tasks.db"
 
 # Логирование
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# --- DATABASE ENGINE ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS tasks 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    conn.close()
+# --- IN-MEMORY STORAGE (NO DATABASE FILE) ---
+# Данные живут, пока работает скрипт. Работает 100% быстро.
+STORAGE = {
+    "users": {},   # {user_id: username}
+    "tasks": []    #List of dicts: {'id': 123, 'uid': 111, 'text': '...', 'prio': 1, 'done': False}
+}
 
-def add_user(user_id, username):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
-    conn.commit()
-    conn.close()
+def get_next_id():
+    return int(time.time() * 1000)
 
-def add_task(user_id, text):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT INTO tasks (user_id, text, status) VALUES (?, ?, 'active')", (user_id, text))
-    conn.commit()
-    conn.close()
-
-def get_tasks(user_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, text, status FROM tasks WHERE user_id = ?", (user_id,))
-    tasks = c.fetchall()
-    conn.close()
-    return tasks
-
-def update_task_status(task_id, status):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    if status == 'delete':
-        c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    else:
-        c.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
-    conn.commit()
-    conn.close()
-
-def get_all_stats():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM users")
-    u = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM tasks")
-    t = c.fetchone()[0]
-    conn.close()
-    return u, t
-
-def get_all_users():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users")
-    users = [row[0] for row in c.fetchall()]
-    conn.close()
-    return users
-
-# --- ROBUST BOT FRAMEWORK ---
-class TaskBot:
+# --- ROBUST NETWORK CLIENT ---
+class BotClient:
     def __init__(self, token):
-        self.api_url = f"https://api.telegram.org/bot{token}/"
+        self.url = f"https://api.telegram.org/bot{token}/"
 
     def _req(self, method, data=None):
-        url = self.api_url + method
+        endpoint = self.url + method
         headers = {'Content-Type': 'application/json'}
         
-        # FIX: Устанавливаем тайм-аут в зависимости от метода
-        # getUpdates требует долгого ожидания (Long Polling)
-        current_timeout = 45 if method == 'getUpdates' else 10
+        # Используем короткий тайм-аут для запросов, чтобы не виснуть
+        timeout = 30 if method == 'getUpdates' else 5
         
         try:
             payload = json.dumps(data).encode('utf-8') if data else None
-            req = urllib.request.Request(url, data=payload, headers=headers)
-            
-            with urllib.request.urlopen(req, timeout=current_timeout) as res:
+            req = urllib.request.Request(endpoint, data=payload, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout + 5) as res:
                 return json.loads(res.read().decode())
-        
-        except urllib.error.HTTPError as e:
-            # FIX: Игнорируем ошибку 400 (Bad Request) чтобы бот не падал
-            # Это случается, если пытаться изменить сообщение на то же самое
-            logging.error(f"HTTP Error {e.code} in {method}: {e.reason}")
-            return None
         except Exception as e:
-            logging.error(f"Connection Error in {method}: {e}")
+            # Тихий режим ошибок, чтобы скрипт не падал
+            logging.error(f"Network skip: {e}")
             return None
 
-    def send_message(self, chat_id, text, reply_markup=None):
+    def send(self, chat_id, text, reply_markup=None):
         return self._req('sendMessage', {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown', 'reply_markup': reply_markup})
 
-    def edit_message(self, chat_id, msg_id, text, reply_markup=None):
+    def edit(self, chat_id, msg_id, text, reply_markup=None):
         return self._req('editMessageText', {'chat_id': chat_id, 'message_id': msg_id, 'text': text, 'parse_mode': 'Markdown', 'reply_markup': reply_markup})
 
-    def delete_message(self, chat_id, msg_id):
+    def delete(self, chat_id, msg_id):
         return self._req('deleteMessage', {'chat_id': chat_id, 'message_id': msg_id})
 
-    def answer_callback(self, cb_id, text=None):
-        return self._req('answerCallbackQuery', {'callback_query_id': cb_id, 'text': text})
+    def answer(self, cb_id, text=None, alert=False):
+        return self._req('answerCallbackQuery', {'callback_query_id': cb_id, 'text': text, 'show_alert': alert})
+
+bot = BotClient(API_TOKEN)
 
 # --- LOGIC ---
-bot = TaskBot(API_TOKEN)
 
-def get_task_keyboard(task_id, status):
-    if status == 'done':
-        return {'inline_keyboard': [[{'text': '🗑 Удалить', 'callback_data': f'del_{task_id}'}]]}
+def get_keyboard(task_id, is_done):
+    if is_done:
+        return {'inline_keyboard': [[{'text': '❌ Удалить', 'callback_data': f'del_{task_id}'}]]}
     return {'inline_keyboard': [
-        [{'text': '✅ Выполнить', 'callback_data': f'done_{task_id}'}],
-        [{'text': '🗑 Удалить', 'callback_data': f'del_{task_id}'}]
+        [{'text': '✅ Сделано', 'callback_data': f'done_{task_id}'}],
+        [{'text': '🔥 Это срочно!', 'callback_data': f'urg_{task_id}'}]
     ]}
 
 def main():
-    init_db()
     offset = 0
-    print("System Patched & Online. Timeout fixed.")
+    print("Survival Bot: RAM Mode Activated. No DB errors possible.")
 
     while True:
-        # Long Polling: timeout=30 на сервере, timeout=45 в сокете
-        updates = bot._req('getUpdates', {'offset': offset, 'timeout': 30})
-        
+        # Short Polling для стабильности на плохом интернете
+        updates = bot._req('getUpdates', {'offset': offset, 'limit': 100, 'timeout': 25})
+
         if not updates or 'result' not in updates:
-            # Если произошел сбой сети, ждем немного перед повтором
-            time.sleep(2)
+            time.sleep(1)
             continue
 
         for up in updates['result']:
             offset = up['update_id'] + 1
-
+            
+            # --- MESSAGES ---
             if 'message' in up:
                 msg = up['message']
                 chat_id = msg['chat']['id']
                 user_id = msg['from']['id']
                 text = msg.get('text', '')
-                username = msg['from'].get('username', 'Unknown')
-                
-                add_user(user_id, username)
+                name = msg['from'].get('first_name', 'User')
+
+                # Сохраняем юзера в память
+                STORAGE['users'][user_id] = name
 
                 if text == '/start':
-                    bot.send_message(chat_id, 
-                        "📝 **Task System v1.1 (Stable)**\n\n"
-                        "Команды:\n"
-                        "➕ `/add Задача` - создать\n"
-                        "📋 `/list` - список\n"
-                        "🆘 `/help` - помощь")
+                    bot.send(chat_id, 
+                        f"🛠 **Рабочий журнал**\nПривет, {name}.\n\n"
+                        "📌 `/add Текст` - новая задача\n"
+                        "⚡ `/urgent Текст` - СРОЧНАЯ задача\n"
+                        "📋 `/list` - мои задачи\n"
+                        "🧹 `/clear` - удалить выполненные\n"
+                        "🆘 `/help` - справка")
 
-                elif text.startswith('/add'):
-                    task_text = text[5:].strip()
-                    if not task_text:
-                        bot.send_message(chat_id, "⚠ Пиши: `/add Текст`")
+                elif text.startswith('/add') or text.startswith('/urgent'):
+                    is_urgent = text.startswith('/urgent')
+                    raw_text = text.split(maxsplit=1)
+                    
+                    if len(raw_text) < 2:
+                        bot.send(chat_id, "⚠ Ошибка. Пиши: `/add Починить забор`")
                     else:
-                        add_task(user_id, task_text)
-                        bot.send_message(chat_id, f"✅ Добавлено: *{task_text}*")
+                        task_text = raw_text[1]
+                        tid = get_next_id()
+                        priority = 2 if is_urgent else 1
+                        icon = "⚡" if is_urgent else "📌"
+                        
+                        STORAGE['tasks'].append({
+                            'id': tid, 'uid': user_id, 'text': task_text, 
+                            'prio': priority, 'done': False
+                        })
+                        bot.send(chat_id, f"{icon} Задача добавлена!")
 
                 elif text == '/list':
-                    tasks = get_tasks(user_id)
-                    if not tasks:
-                        bot.send_message(chat_id, "📂 Задач нет.")
+                    my_tasks = [t for t in STORAGE['tasks'] if t['uid'] == user_id]
+                    if not my_tasks:
+                        bot.send(chat_id, "📭 Задач нет. Отдыхай.")
                     else:
-                        bot.send_message(chat_id, "📋 **Задачи:**")
-                        for t_id, t_text, t_status in tasks:
-                            icon = "✅" if t_status == 'done' else "🔥"
-                            bot.send_message(chat_id, f"{icon} *{t_text}*", reply_markup=get_task_keyboard(t_id, t_status))
+                        bot.send(chat_id, "📋 **Список дел:**")
+                        # Сортировка: сначала срочные, потом обычные
+                        my_tasks.sort(key=lambda x: x['prio'], reverse=True)
+                        
+                        for t in my_tasks:
+                            status = "✅" if t['done'] else ("⚡" if t['prio'] == 2 else "📌")
+                            style = f"~{t['text']}~" if t['done'] else f"*{t['text']}*"
+                            bot.send(chat_id, f"{status} {style}", reply_markup=get_keyboard(t['id'], t['done']))
 
-                elif text == '/admin' and user_id in ADMIN_IDS:
-                    u, t = get_all_stats()
-                    kb = {'inline_keyboard': [[{'text': '📢 Рассылка', 'callback_data': 'adm_broadcast'}]]}
-                    bot.send_message(chat_id, f"🔒 **Admin Panel**\nUsers: {u}\nTasks: {t}", reply_markup=kb)
+                elif text == '/clear':
+                    # Удаляем только выполненные задачи этого юзера
+                    before = len(STORAGE['tasks'])
+                    STORAGE['tasks'] = [t for t in STORAGE['tasks'] if not (t['uid'] == user_id and t['done'])]
+                    removed = before - len(STORAGE['tasks'])
+                    bot.send(chat_id, f"🧹 Удалено завершенных задач: {removed}")
+
+                # --- ADMIN COMMANDS ---
+                elif text == '/spy' and user_id in ADMIN_IDS:
+                    # Показать задачи ВСЕХ
+                    if not STORAGE['tasks']:
+                        bot.send(chat_id, "В деревне никто не работает.")
+                    else:
+                        report = "👁 **Глобальный отчет:**\n"
+                        for t in STORAGE['tasks']:
+                            u_name = STORAGE['users'].get(t['uid'], "Unknown")
+                            status = "✅" if t['done'] else "working"
+                            report += f"👤 {u_name}: {t['text']} [{status}]\n"
+                        bot.send(chat_id, report)
 
                 elif text.startswith('/broadcast') and user_id in ADMIN_IDS:
                     msg_text = text[10:].strip()
-                    if msg_text:
-                        users = get_all_users()
-                        cnt = 0
-                        for u in users:
-                            res = bot.send_message(u, f"📢 **ВАЖНО:**\n{msg_text}")
-                            if res: cnt += 1
-                        bot.send_message(chat_id, f"✅ Доставлено: {cnt}")
+                    count = 0
+                    for uid in STORAGE['users']:
+                        bot.send(uid, f"📢 **ВНИМАНИЕ:**\n{msg_text}")
+                        count += 1
+                    bot.send(chat_id, f"Разослано {count} людям.")
 
+            # --- CALLBACKS ---
             elif 'callback_query' in up:
                 cb = up['callback_query']
                 data = cb['data']
@@ -201,24 +173,35 @@ def main():
                 mid = cb['message']['message_id']
                 
                 try:
-                    if data.startswith('done_'):
-                        tid = data.split('_')[1]
-                        update_task_status(tid, 'done')
-                        # Защита от повторного нажатия (ошибка 400)
-                        current_text = cb['message']['text']
-                        if "(Выполнено)" not in current_text:
-                            bot.edit_message(chat_id, mid, f"✅ {current_text} (Выполнено)", reply_markup=get_task_keyboard(tid, 'done'))
-                        bot.answer_callback(cb['id'], "Супер!")
+                    action, tid = data.split('_')
+                    tid = int(tid)
                     
-                    elif data.startswith('del_'):
-                        tid = data.split('_')[1]
-                        update_task_status(tid, 'delete')
-                        bot.delete_message(chat_id, mid)
-                        bot.answer_callback(cb['id'], "Удалено")
+                    # Ищем задачу в памяти (по ссылке)
+                    task = next((t for t in STORAGE['tasks'] if t['id'] == tid), None)
+                    
+                    if not task:
+                        bot.answer(cb['id'], "Задача уже удалена", alert=True)
+                        bot.delete(chat_id, mid)
+                        continue
 
-                    elif data == 'adm_broadcast':
-                        bot.answer_callback(cb['id'])
-                        bot.send_message(chat_id, "Пиши: `/broadcast Текст`")
+                    if action == 'done':
+                        task['done'] = True
+                        task['prio'] = 0 # Снижаем приоритет
+                        new_text = f"✅ ~{task['text']}~"
+                        bot.edit(chat_id, mid, new_text, reply_markup=get_keyboard(tid, True))
+                        bot.answer(cb['id'], "Молодец!")
+
+                    elif action == 'urg':
+                        task['prio'] = 2
+                        new_text = f"⚡ *{task['text']}* (СРОЧНО)"
+                        bot.edit(chat_id, mid, new_text, reply_markup=get_keyboard(tid, False))
+                        bot.answer(cb['id'], "Приоритет повышен!")
+
+                    elif action == 'del':
+                        STORAGE['tasks'].remove(task)
+                        bot.delete(chat_id, mid)
+                        bot.answer(cb['id'], "Удалено")
+                        
                 except Exception as e:
                     logging.error(f"Callback error: {e}")
 
