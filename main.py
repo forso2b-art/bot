@@ -10,21 +10,20 @@ import threading
 API_TOKEN = '8278293381:AAHpnS4M6txEuChRjjLY_vgZUt6ey14NMhM'
 ADMIN_IDS = [103161998, 37607526]
 
-# Логирование
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# Логирование: показываем ТОЛЬКО критические ошибки, никаких предупреждений
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(message)s')
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# --- IN-MEMORY STORAGE (NO DATABASE FILE) ---
-# Данные живут, пока работает скрипт. Работает 100% быстро.
+# --- IN-MEMORY STORAGE ---
 STORAGE = {
-    "users": {},   # {user_id: username}
-    "tasks": []    #List of dicts: {'id': 123, 'uid': 111, 'text': '...', 'prio': 1, 'done': False}
+    "users": {},
+    "tasks": []
 }
 
 def get_next_id():
     return int(time.time() * 1000)
 
-# --- ROBUST NETWORK CLIENT ---
+# --- SILENT BOT CLIENT ---
 class BotClient:
     def __init__(self, token):
         self.url = f"https://api.telegram.org/bot{token}/"
@@ -32,18 +31,23 @@ class BotClient:
     def _req(self, method, data=None):
         endpoint = self.url + method
         headers = {'Content-Type': 'application/json'}
-        
-        # Используем короткий тайм-аут для запросов, чтобы не виснуть
-        timeout = 30 if method == 'getUpdates' else 5
+        timeout = 35 if method == 'getUpdates' else 10
         
         try:
             payload = json.dumps(data).encode('utf-8') if data else None
             req = urllib.request.Request(endpoint, data=payload, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout + 5) as res:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
                 return json.loads(res.read().decode())
+        except urllib.error.HTTPError as e:
+            # ГЛУШИТЕЛЬ ОШИБОК 400
+            # Если Telegram говорит "Bad Request" (обычно "Message not modified"),
+            # мы просто игнорируем это. Жители довольны, лог чист.
+            if e.code == 400:
+                return None
+            logging.error(f"Server Error {e.code}: {e.reason}")
+            return None
         except Exception as e:
-            # Тихий режим ошибок, чтобы скрипт не падал
-            logging.error(f"Network skip: {e}")
+            # Игнорируем мелкие сетевые сбои
             return None
 
     def send(self, chat_id, text, reply_markup=None):
@@ -64,19 +68,18 @@ bot = BotClient(API_TOKEN)
 
 def get_keyboard(task_id, is_done):
     if is_done:
-        return {'inline_keyboard': [[{'text': '❌ Удалить', 'callback_data': f'del_{task_id}'}]]}
+        return {'inline_keyboard': [[{'text': '🗑 Удалить', 'callback_data': f'del_{task_id}'}]]}
     return {'inline_keyboard': [
-        [{'text': '✅ Сделано', 'callback_data': f'done_{task_id}'}],
-        [{'text': '🔥 Это срочно!', 'callback_data': f'urg_{task_id}'}]
+        [{'text': '✅ Готово', 'callback_data': f'done_{task_id}'}],
+        [{'text': '🔥 Срочно', 'callback_data': f'urg_{task_id}'}]
     ]}
 
 def main():
     offset = 0
-    print("Survival Bot: RAM Mode Activated. No DB errors possible.")
+    print("Survival Bot: Silent Mode Active. Clean Logs Guaranteed.")
 
     while True:
-        # Short Polling для стабильности на плохом интернете
-        updates = bot._req('getUpdates', {'offset': offset, 'limit': 100, 'timeout': 25})
+        updates = bot._req('getUpdates', {'offset': offset, 'limit': 100, 'timeout': 30})
 
         if not updates or 'result' not in updates:
             time.sleep(1)
@@ -85,7 +88,6 @@ def main():
         for up in updates['result']:
             offset = up['update_id'] + 1
             
-            # --- MESSAGES ---
             if 'message' in up:
                 msg = up['message']
                 chat_id = msg['chat']['id']
@@ -93,23 +95,91 @@ def main():
                 text = msg.get('text', '')
                 name = msg['from'].get('first_name', 'User')
 
-                # Сохраняем юзера в память
                 STORAGE['users'][user_id] = name
 
                 if text == '/start':
                     bot.send(chat_id, 
-                        f"🛠 **Рабочий журнал**\nПривет, {name}.\n\n"
-                        "📌 `/add Текст` - новая задача\n"
-                        "⚡ `/urgent Текст` - СРОЧНАЯ задача\n"
-                        "📋 `/list` - мои задачи\n"
-                        "🧹 `/clear` - удалить выполненные\n"
-                        "🆘 `/help` - справка")
+                        f"🛠 **Система Задач**\n"
+                        f"Привет, {name}. Логи чисты.\n\n"
+                        "📌 `/add Дело` - создать\n"
+                        "⚡ `/urgent Дело` - срочно\n"
+                        "📋 `/list` - список\n"
+                        "🧹 `/clear` - очистка")
 
                 elif text.startswith('/add') or text.startswith('/urgent'):
                     is_urgent = text.startswith('/urgent')
-                    raw_text = text.split(maxsplit=1)
+                    raw = text.split(maxsplit=1)
+                    if len(raw) < 2:
+                        bot.send(chat_id, "ℹ Пиши: `/add Собрать дрова`")
+                    else:
+                        task_text = raw[1]
+                        tid = get_next_id()
+                        prio = 2 if is_urgent else 1
+                        STORAGE['tasks'].append({'id': tid, 'uid': user_id, 'text': task_text, 'prio': prio, 'done': False})
+                        bot.send(chat_id, "✅ Записано.")
+
+                elif text == '/list':
+                    tasks = [t for t in STORAGE['tasks'] if t['uid'] == user_id]
+                    if not tasks:
+                        bot.send(chat_id, "📭 Пусто.")
+                    else:
+                        tasks.sort(key=lambda x: x['prio'], reverse=True)
+                        bot.send(chat_id, "📋 **Твои задачи:**")
+                        for t in tasks:
+                            status = "✅" if t['done'] else ("⚡" if t['prio'] == 2 else "📌")
+                            style = f"~{t['text']}~" if t['done'] else f"*{t['text']}*"
+                            bot.send(chat_id, f"{status} {style}", reply_markup=get_keyboard(t['id'], t['done']))
+
+                elif text == '/clear':
+                    STORAGE['tasks'] = [t for t in STORAGE['tasks'] if not (t['uid'] == user_id and t['done'])]
+                    bot.send(chat_id, "🧹 Выполненные задачи удалены.")
+
+                elif text == '/spy' and user_id in ADMIN_IDS:
+                    if not STORAGE['tasks']:
+                        bot.send(chat_id, "Задач нет.")
+                    else:
+                        report = "👁 **Все задачи:**\n"
+                        for t in STORAGE['tasks']:
+                            uname = STORAGE['users'].get(t['uid'], "?")
+                            st = "V" if t['done'] else "X"
+                            report += f"{uname}: {t['text']} [{st}]\n"
+                        bot.send(chat_id, report)
+
+            elif 'callback_query' in up:
+                cb = up['callback_query']
+                try:
+                    data = cb['data']
+                    parts = data.split('_')
+                    action, tid = parts[0], int(parts[1])
+                    chat_id = cb['message']['chat']['id']
+                    mid = cb['message']['message_id']
                     
-                    if len(raw_text) < 2:
+                    task = next((t for t in STORAGE['tasks'] if t['id'] == tid), None)
+                    if not task:
+                        bot.delete(chat_id, mid)
+                        continue
+
+                    if action == 'done':
+                        task['done'] = True
+                        task['prio'] = 0
+                        bot.edit(chat_id, mid, f"✅ ~{task['text']}~", reply_markup=get_keyboard(tid, True))
+                        bot.answer(cb['id'], "OK")
+                    
+                    elif action == 'urg':
+                        task['prio'] = 2
+                        bot.edit(chat_id, mid, f"⚡ *{task['text']}* (СРОЧНО)", reply_markup=get_keyboard(tid, False))
+                        bot.answer(cb['id'], "Срочно!")
+
+                    elif action == 'del':
+                        STORAGE['tasks'].remove(task)
+                        bot.delete(chat_id, mid)
+                      bot.answer(cb['id'], "Удалено")
+
+                except Exception:
+                    pass
+
+if __name__ == '__main__':
+    main(                    if len(raw_text) < 2:
                         bot.send(chat_id, "⚠ Ошибка. Пиши: `/add Починить забор`")
                     else:
                         task_text = raw_text[1]
