@@ -2,159 +2,211 @@ import json
 import logging
 import urllib.request
 import urllib.parse
-import re
+import sqlite3
 import time
 import ssl
 
 # --- CONFIGURATION ---
 API_TOKEN = '8278293381:AAHpnS4M6txEuChRjjLY_vgZUt6ey14NMhM'
-ADMIN_IDS = [103161998, 37607526]
+ADMIN_IDS = [103161998, 37607526]  # Ваши ID
+DB_FILE = "village_tasks.db"
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("SurvivalBot")
-
-# Игнорирование ошибок SSL для старых серверов
+# Логирование
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# --- MINI-FRAMEWORK (NO LIBRARIES REQUIRED) ---
-class SurvivalBot:
+# --- DATABASE ENGINE (SQLite) ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # Таблица пользователей
+    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT)''')
+    # Таблица задач
+    c.execute('''CREATE TABLE IF NOT EXISTS tasks 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+def add_user(user_id, username):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+    conn.commit()
+    conn.close()
+
+def add_task(user_id, text):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO tasks (user_id, text, status) VALUES (?, ?, 'active')", (user_id, text))
+    conn.commit()
+    conn.close()
+
+def get_tasks(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, text, status FROM tasks WHERE user_id = ?", (user_id,))
+    tasks = c.fetchall()
+    conn.close()
+    return tasks
+
+def update_task_status(task_id, status):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if status == 'delete':
+        c.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    else:
+        c.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.commit()
+    conn.close()
+
+def get_all_stats():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    users_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM tasks")
+    tasks_count = c.fetchone()[0]
+    conn.close()
+    return users_count, tasks_count
+
+def get_all_users():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    users = [row[0] for row in c.fetchall()]
+    conn.close()
+    return users
+
+# --- BOT FRAMEWORK (NO EXTERNAL LIBS) ---
+class TaskBot:
     def __init__(self, token):
         self.api_url = f"https://api.telegram.org/bot{token}/"
 
-    def _request(self, method, data=None):
+    def _req(self, method, data=None):
         url = self.api_url + method
         headers = {'Content-Type': 'application/json'}
         try:
-            if data:
-                payload = json.dumps(data).encode('utf-8')
-                req = urllib.request.Request(url, data=payload, headers=headers)
-            else:
-                req = urllib.request.Request(url)
-            
-            with urllib.request.urlopen(req, timeout=10) as response:
-                return json.loads(response.read().decode('utf-8'))
+            payload = json.dumps(data).encode('utf-8') if data else None
+            req = urllib.request.Request(url, data=payload, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as res:
+                return json.loads(res.read().decode())
         except Exception as e:
-            logger.error(f"Network error: {e}")
+            logging.error(f"Error {method}: {e}")
             return None
 
     def send_message(self, chat_id, text, reply_markup=None):
-        data = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
-        if reply_markup:
-            data['reply_markup'] = reply_markup
-        return self._request('sendMessage', data)
+        return self._req('sendMessage', {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown', 'reply_markup': reply_markup})
 
-    def send_photo(self, chat_id, photo_url, caption=None, reply_markup=None):
-        data = {'chat_id': chat_id, 'photo': photo_url, 'caption': caption, 'parse_mode': 'Markdown'}
-        if reply_markup:
-            data['reply_markup'] = reply_markup
-        return self._request('sendPhoto', data)
+    def edit_message(self, chat_id, msg_id, text, reply_markup=None):
+        return self._req('editMessageText', {'chat_id': chat_id, 'message_id': msg_id, 'text': text, 'parse_mode': 'Markdown', 'reply_markup': reply_markup})
 
-    def get_updates(self, offset=None):
-        data = {'timeout': 30, 'allowed_updates': ['message', 'callback_query']}
-        if offset:
-            data['offset'] = offset
-        return self._request('getUpdates', data)
+    def answer_callback(self, cb_id, text=None):
+        return self._req('answerCallbackQuery', {'callback_query_id': cb_id, 'text': text})
 
-    def answer_callback(self, callback_id, text=None, show_alert=False):
-        data = {'callback_query_id': callback_id, 'show_alert': show_alert}
-        if text:
-            data['text'] = text
-        return self._request('answerCallbackQuery', data)
+# --- LOGIC ---
+bot = TaskBot(API_TOKEN)
 
-# --- PINTEREST LOGIC (REGEX ONLY) ---
-def get_pinterest_image_no_lib(url):
-    try:
-        # Эмуляция браузера (обязательно для Pinterest)
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        }
-        req = urllib.request.Request(url, headers=headers)
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html_content = response.read().decode('utf-8')
-            
-            # Поиск ссылки на изображение через Regex (ищем og:image)
-            # Это заменяет BeautifulSoup
-            match = re.search(r'<meta property="og:image" content="([^"]+)"', html_content)
-            if match:
-                return match.group(1)
-            
-            # Запасной вариант: ищем link rel="image_src"
-            match_alt = re.search(r'<link rel="image_src" href="([^"]+)"', html_content)
-            if match_alt:
-                return match_alt.group(1)
-                
-            return None
-    except Exception as e:
-        logger.error(f"Pinterest parsing error: {e}")
-        return None
+def get_task_keyboard(task_id, status):
+    if status == 'done':
+        return {'inline_keyboard': [[{'text': '🗑 Удалить', 'callback_data': f'del_{task_id}'}]]}
+    return {'inline_keyboard': [
+        [{'text': '✅ Выполнить', 'callback_data': f'done_{task_id}'}],
+        [{'text': '🗑 Удалить', 'callback_data': f'del_{task_id}'}]
+    ]}
 
-# --- MAIN ---
 def main():
-    bot = SurvivalBot(API_TOKEN)
+    init_db()
     offset = 0
-    print("Survival Bot v5 (No-Lib) Started...")
+    print("System Online. Waiting for orders...")
 
     while True:
-        updates_response = bot.get_updates(offset)
+        updates = bot._req('getUpdates', {'offset': offset, 'timeout': 30})
         
-        if not updates_response or not updates_response.get('ok'):
-            time.sleep(2)
+        if not updates or 'result' not in updates:
+            time.sleep(1)
             continue
 
-        for update in updates_response.get('result', []):
-            offset = update['update_id'] + 1
-            
-            # 1. Обработка сообщений
-            if 'message' in update:
-                msg = update['message']
+        for up in updates['result']:
+            offset = up['update_id'] + 1
+
+            # 1. MESSAGES
+            if 'message' in up:
+                msg = up['message']
                 chat_id = msg['chat']['id']
                 user_id = msg['from']['id']
                 text = msg.get('text', '')
-
-                # Команды
-                if text == '/start':
-                    kb = {'inline_keyboard': [[{'text': '🆘 Помощь', 'callback_data': 'help'}]]}
-                    bot.send_message(chat_id, "👋 **Система готова.**\nПришли ссылку с Pinterest.", reply_markup=kb)
+                username = msg['from'].get('username', 'Unknown')
                 
-                elif text == '/admin':
-                    if user_id in ADMIN_IDS:
-                        kb = {'inline_keyboard': [[{'text': 'Статистика', 'callback_data': 'stats'}]]}
-                        bot.send_message(chat_id, "🔓 **Админ-панель активна**", reply_markup=kb)
-                    else:
-                        # Игнорируем или отвечаем стандартно
-                        pass
+                add_user(user_id, username)
 
-                # Обработка ссылок
-                elif 'pin.it' in text or 'pinterest.com' in text:
-                    bot.send_message(chat_id, "🔍 *Ищу фото...*")
-                    image_url = get_pinterest_image_no_lib(text)
-                    
-                    if image_url:
-                        kb = {'inline_keyboard': [[{'text': '🔗 Источник', 'url': text}]]}
-                        bot.send_photo(chat_id, image_url, "✅ **Готово**", reply_markup=kb)
-                    else:
-                        bot.send_message(chat_id, "❌ Не удалось найти фото. Проверьте ссылку.")
+                # --- USER COMMANDS ---
+                if text == '/start':
+                    bot.send_message(chat_id, 
+                        "📝 **Task System v1.0**\n\n"
+                        "Команды:\n"
+                        "➕ `/add Купить еды` - создать задачу\n"
+                        "📋 `/list` - мои задачи\n"
+                        "🆘 `/help` - помощь")
 
-            # 2. Обработка кнопок (Callback Query)
-            elif 'callback_query' in update:
-                cb = update['callback_query']
-                cb_id = cb['id']
+                elif text.startswith('/add'):
+                    task_text = text[5:].strip()
+                    if not task_text:
+                        bot.send_message(chat_id, "⚠ Ошибка. Пиши: `/add Текст задачи`")
+                    else:
+                        add_task(user_id, task_text)
+                        bot.send_message(chat_id, f"✅ Задача добавлена: *{task_text}*")
+
+                elif text == '/list':
+                    tasks = get_tasks(user_id)
+                    if not tasks:
+                        bot.send_message(chat_id, "📂 У вас нет активных задач.")
+                    else:
+                        bot.send_message(chat_id, "📋 **Ваши задачи:**")
+                        for t_id, t_text, t_status in tasks:
+                            status_icon = "✅" if t_status == 'done' else "🔥"
+                            bot.send_message(chat_id, f"{status_icon} *{t_text}*", reply_markup=get_task_keyboard(t_id, t_status))
+
+                # --- ADMIN COMMANDS ---
+                elif text == '/admin' and user_id in ADMIN_IDS:
+                    u_count, t_count = get_all_stats()
+                    kb = {'inline_keyboard': [[{'text': '📢 Рассылка', 'callback_data': 'adm_broadcast'}]]}
+                    bot.send_message(chat_id, 
+                        f"🔒 **Admin Control Panel**\n\n"
+                        f"👥 Пользователей: {u_count}\n"
+                        f"📝 Всего задач: {t_count}", reply_markup=kb)
+
+                elif text.startswith('/broadcast') and user_id in ADMIN_IDS:
+                    msg_text = text[10:].strip()
+                    if msg_text:
+                        users = get_all_users()
+                        count = 0
+                        for u in users:
+                            bot.send_message(u, f"📢 **ОБЪЯВЛЕНИЕ:**\n{msg_text}")
+                            count += 1
+                        bot.send_message(chat_id, f"✅ Отправлено {count} пользователям.")
+
+            # 2. CALLBACKS (BUTTONS)
+            elif 'callback_query' in up:
+                cb = up['callback_query']
                 data = cb['data']
                 chat_id = cb['message']['chat']['id']
+                mid = cb['message']['message_id']
                 
-                if data == 'help':
-                    bot.answer_callback(cb_id, "Просто отправь ссылку!")
-                    bot.send_message(chat_id, "ℹ️ Отправь ссылку вида `https://pin.it/...`")
-                elif data == 'stats':
-                    bot.answer_callback(cb_id, "Все системы в норме", show_alert=True)
+                if data.startswith('done_'):
+                    tid = data.split('_')[1]
+                    update_task_status(tid, 'done')
+                    bot.edit_message(chat_id, mid, f"✅ {cb['message']['text']} (Выполнено)", reply_markup=get_task_keyboard(tid, 'done'))
+                    bot.answer_callback(cb['id'], "Отлично!")
+                
+                elif data.startswith('del_'):
+                    tid = data.split('_')[1]
+                    update_task_status(tid, 'delete')
+                    bot._req('deleteMessage', {'chat_id': chat_id, 'message_id': mid})
+                    bot.answer_callback(cb['id'], "Удалено")
 
-        time.sleep(0.5)
+                elif data == 'adm_broadcast':
+                    bot.answer_callback(cb['id'])
+                    bot.send_message(chat_id, "Пиши: `/broadcast Текст` для рассылки всем.")
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Bot stopped.")
+    main()
