@@ -1381,7 +1381,7 @@ async def complete_task(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("uncomplete_task_"))
 async def uncomplete_task(callback: CallbackQuery):
     """Вернуть задачу в активные"""
-    task_id = int(callback.data.split("_", 2)[2]
+    task_id = int(callback.data.split("_", 2)[2])
     
     if db.toggle_task(task_id):
         task = db.get_task(task_id)
