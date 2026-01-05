@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -16,6 +17,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    FSInputFile,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
@@ -50,7 +52,9 @@ class Database:
         self.admin_stats = {
             'total_tasks': 0,
             'completed_tasks': 0,
-            'active_users': set()
+            'active_users': set(),
+            'tasks_today': 0,
+            'users_today': set()
         }
     
     def add_user(self, user_id: int, username: str, full_name: str):
@@ -61,8 +65,11 @@ class Database:
                 'full_name': full_name,
                 'joined': datetime.now(),
                 'task_count': 0,
-                'completed_count': 0
+                'completed_count': 0,
+                'last_active': datetime.now()
             }
+            if datetime.now().date() == self.users[user_id]['joined'].date():
+                self.admin_stats['users_today'].add(user_id)
     
     def add_task(self, user_id: int, text: str, category: str = "Общее") -> int:
         self.task_counter += 1
@@ -79,9 +86,13 @@ class Database:
         
         if user_id in self.users:
             self.users[user_id]['task_count'] += 1
+            self.users[user_id]['last_active'] = datetime.now()
         
         self.admin_stats['total_tasks'] += 1
         self.admin_stats['active_users'].add(user_id)
+        
+        if datetime.now().date() == self.tasks[self.task_counter]['created'].date():
+            self.admin_stats['tasks_today'] += 1
         
         return self.task_counter
     
@@ -99,17 +110,20 @@ class Database:
     def toggle_task(self, task_id: int) -> bool:
         task = self.tasks.get(task_id)
         if task:
+            was_completed = task['completed']
             task['completed'] = not task['completed']
             task['completed_at'] = datetime.now() if task['completed'] else None
             
             user_id = task['user_id']
-            if task['completed']:
-                if user_id in self.users:
+            if user_id in self.users:
+                if task['completed'] and not was_completed:
                     self.users[user_id]['completed_count'] += 1
-                self.admin_stats['completed_tasks'] += 1
-            else:
-                if user_id in self.users:
+                elif not task['completed'] and was_completed:
                     self.users[user_id]['completed_count'] -= 1
+            
+            if task['completed'] and not was_completed:
+                self.admin_stats['completed_tasks'] += 1
+            elif not task['completed'] and was_completed:
                 self.admin_stats['completed_tasks'] -= 1
             
             return True
@@ -150,6 +164,21 @@ class Database:
             task['category'] = category
             return True
         return False
+    
+    def update_task_text(self, task_id: int, text: str) -> bool:
+        task = self.tasks.get(task_id)
+        if task:
+            task['text'] = text
+            return True
+        return False
+    
+    def get_tasks_by_category(self, user_id: int, category: str) -> List[Dict]:
+        return [task for task in self.tasks.values() 
+                if task['user_id'] == user_id and task['category'] == category]
+    
+    def search_tasks(self, user_id: int, query: str) -> List[Dict]:
+        return [task for task in self.tasks.values() 
+                if task['user_id'] == user_id and query.lower() in task['text'].lower()]
 
 db = Database()
 
@@ -161,10 +190,13 @@ class TaskStates(StatesGroup):
     editing_text = State()
     editing_category = State()
     editing_priority = State()
+    searching_tasks = State()
 
 class AdminStates(StatesGroup):
     waiting_broadcast = State()
     waiting_user_message = State()
+    waiting_user_id = State()
+    waiting_export_format = State()
 
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -173,14 +205,16 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     
     builder.add(KeyboardButton(text="📝 Создать задачу"))
     builder.add(KeyboardButton(text="📋 Мои задачи"))
-    builder.add(KeyboardButton(text="✅ Выполненные"))
+    builder.add(KeyboardButton(text="🔍 Поиск задач"))
     builder.add(KeyboardButton(text="📊 Статистика"))
+    builder.add(KeyboardButton(text="✅ Выполненные"))
+    builder.add(KeyboardButton(text="📂 По категориям"))
     
     # Скрытые админ-кнопки только для админов
     if user_id in ADMIN_IDS:
         builder.add(KeyboardButton(text="⚙️ Админ-панель"))
     
-    builder.adjust(2, 2, 1)
+    builder.adjust(2, 2, 2)
     return builder.as_markup(resize_keyboard=True)
 
 def get_tasks_keyboard(tasks: List[Dict], page: int = 0, tasks_per_page: int = 5) -> InlineKeyboardMarkup:
@@ -256,27 +290,27 @@ def get_task_detail_keyboard(task_id: int, is_completed: bool) -> InlineKeyboard
     builder.adjust(1)
     return builder.as_markup()
 
-def get_priority_keyboard() -> InlineKeyboardMarkup:
+def get_priority_keyboard(action: str = "create") -> InlineKeyboardMarkup:
     """Клавиатура для выбора приоритета"""
     builder = InlineKeyboardBuilder()
     
     builder.add(InlineKeyboardButton(
         text="🔴 Высокий",
-        callback_data="priority_high"
+        callback_data=f"priority_{action}_high"
     ))
     builder.add(InlineKeyboardButton(
         text="🟡 Средний",
-        callback_data="priority_medium"
+        callback_data=f"priority_{action}_medium"
     ))
     builder.add(InlineKeyboardButton(
         text="🟢 Низкий",
-        callback_data="priority_low"
+        callback_data=f"priority_{action}_low"
     ))
     
     builder.adjust(1)
     return builder.as_markup()
 
-def get_category_keyboard() -> InlineKeyboardMarkup:
+def get_category_keyboard(action: str = "create") -> InlineKeyboardMarkup:
     """Клавиатура для выбора категории"""
     builder = InlineKeyboardBuilder()
     
@@ -285,12 +319,12 @@ def get_category_keyboard() -> InlineKeyboardMarkup:
     for category in categories:
         builder.add(InlineKeyboardButton(
             text=category,
-            callback_data=f"category_{category}"
+            callback_data=f"category_{action}_{category}"
         ))
     
     builder.add(InlineKeyboardButton(
         text="✏️ Своя категория",
-        callback_data="category_custom"
+        callback_data=f"category_{action}_custom"
     ))
     
     builder.adjust(2)
@@ -374,6 +408,78 @@ def get_admin_tasks_keyboard(tasks: List[Dict], page: int = 0) -> InlineKeyboard
     
     return builder.as_markup()
 
+def get_categories_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для выбора категорий задач"""
+    builder = InlineKeyboardBuilder()
+    
+    # Получаем все уникальные категории пользователя
+    categories = set()
+    for task in db.tasks.values():
+        if task['user_id'] == user_id:
+            categories.add(task['category'])
+    
+    for category in sorted(categories):
+        builder.add(InlineKeyboardButton(
+            text=category,
+            callback_data=f"view_category_{category}"
+        ))
+    
+    builder.add(InlineKeyboardButton(
+        text="🔙 Назад",
+        callback_data="back_to_main"
+    ))
+    
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_edit_task_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для редактирования задачи"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.add(InlineKeyboardButton(
+        text="📝 Текст",
+        callback_data=f"edit_text_{task_id}"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📂 Категория",
+        callback_data=f"edit_category_{task_id}"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🎯 Приоритет",
+        callback_data=f"edit_priority_{task_id}"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🔙 Назад",
+        callback_data=f"task_detail_{task_id}"
+    ))
+    
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_export_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для выбора формата экспорта"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.add(InlineKeyboardButton(
+        text="📝 JSON",
+        callback_data="export_json"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📄 TXT",
+        callback_data="export_txt"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="📊 CSV",
+        callback_data="export_csv"
+    ))
+    builder.add(InlineKeyboardButton(
+        text="🔙 Назад",
+        callback_data="admin_back"
+    ))
+    
+    builder.adjust(2)
+    return builder.as_markup()
+
 # ========== ФОРМАТИРОВАНИЕ ТЕКСТА ==========
 def format_task(task: Dict) -> str:
     """Форматирование задачи для отображения"""
@@ -406,6 +512,20 @@ def format_user_stats(user_id: int) -> str:
     
     if tasks:
         progress = (len(completed_tasks) / len(tasks) * 100) if tasks else 0
+        
+        # Статистика по приоритетам
+        high_priority = len([t for t in tasks if t['priority'] == 'high'])
+        medium_priority = len([t for t in tasks if t['priority'] == 'medium'])
+        low_priority = len([t for t in tasks if t['priority'] == 'low'])
+        
+        # Статистика по категориям
+        categories = {}
+        for task in tasks:
+            cat = task['category']
+            categories[cat] = categories.get(cat, 0) + 1
+        
+        top_category = max(categories.items(), key=lambda x: x[1]) if categories else ("Нет", 0)
+        
         return f"""<b>📊 Ваша статистика</b>
 
 👤 <b>Пользователь:</b> @{user.get('username', 'Без имени')}
@@ -415,7 +535,15 @@ def format_user_stats(user_id: int) -> str:
 📝 Всего задач: {len(tasks)}
 ✅ Выполнено: {len(completed_tasks)}
 ⏳ В работе: {len(active_tasks)}
-🎯 Прогресс: {progress:.1f}%"""
+🎯 Прогресс: {progress:.1f}%
+
+<b>🎯 Приоритеты:</b>
+🔴 Высокий: {high_priority}
+🟡 Средний: {medium_priority}
+🟢 Низкий: {low_priority}
+
+<b>📂 Самая частая категория:</b>
+{top_category[0]} ({top_category[1]} задач)"""
     else:
         return "Создайте первую задачу, чтобы увидеть статистику!"
 
@@ -425,14 +553,22 @@ def format_admin_stats() -> str:
     total_tasks = db.admin_stats['total_tasks']
     completed_tasks = db.admin_stats['completed_tasks']
     active_users = len(db.admin_stats['active_users'])
+    tasks_today = db.admin_stats['tasks_today']
+    users_today = len(db.admin_stats['users_today'])
     
     completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+    
+    # Активность за последние 7 дней (упрощенная версия)
+    week_ago = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    new_users_week = len([u for u in db.users.values() 
+                         if u['joined'] > week_ago])
     
     return f"""<b>⚙️ Статистика бота</b>
 
 <b>👥 Пользователи:</b>
 • Всего пользователей: {total_users}
 • Активных пользователей: {active_users}
+• Новых за неделю: {new_users_week}
 
 <b>📝 Задачи:</b>
 • Всего задач: {total_tasks}
@@ -441,9 +577,10 @@ def format_admin_stats() -> str:
 • Процент выполнения: {completion_rate:.1f}%
 
 <b>📅 За сегодня:</b>
-• Новых пользователей: 0
-• Создано задач: 0
-• Выполнено задач: 0"""
+• Новых пользователей: {users_today}
+• Создано задач: {tasks_today}
+• Выполнено задач: {sum(1 for t in db.tasks.values() 
+                        if t['completed_at'] and t['completed_at'].date() == datetime.now().date())}"""
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 @router.message(Command("start"))
@@ -463,12 +600,15 @@ async def cmd_start(message: Message):
 • Создавать задачи с категориями и приоритетами
 • Отслеживать прогресс выполнения
 • Показывать статистику продуктивности
-• Напоминать о важных делах
+• Искать задачи по тексту
+• Группировать задачи по категориям
 
 Используйте кнопки ниже или команды:
 /start - Главное меню
 /help - Помощь
 /tasks - Мои задачи
+/search - Поиск задач
+/stats - Статистика
 
 <b>🎯 Начните с создания первой задачи!</b>"""
     
@@ -484,6 +624,7 @@ async def cmd_help(message: Message):
 /help - Эта справка
 /tasks - Показать все задачи
 /stats - Ваша статистика
+/search - Поиск задач
 
 <b>🎯 Как работать с задачами:</b>
 1. Нажмите "📝 Создать задачу"
@@ -491,6 +632,15 @@ async def cmd_help(message: Message):
 3. Выберите категорию и приоритет
 4. Отслеживайте выполнение в "📋 Мои задачи"
 5. Отмечайте выполненные задачи
+
+<b>🔍 Поиск задач:</b>
+• Используйте кнопку "🔍 Поиск задач"
+• Введите ключевое слово
+• Найдем задачи по тексту
+
+<b>📂 Категории:</b>
+• Просматривайте задачи по категориям
+• Создавайте свои категории
 
 <b>🔔 Особенности:</b>
 • Задачи можно редактировать
@@ -501,7 +651,8 @@ async def cmd_help(message: Message):
 <b>💡 Советы:</b>
 • Разбивайте большие задачи на мелкие
 • Используйте категории для организации
-• Регулярно проверяйте статистику"""
+• Регулярно проверяйте статистику
+• Помечайте важные задачи высоким приоритетом"""
     
     await message.answer(help_text)
 
@@ -509,6 +660,32 @@ async def cmd_help(message: Message):
 async def cmd_tasks(message: Message):
     """Обработчик команды /tasks"""
     await show_user_tasks(message.from_user.id, message.chat.id)
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Обработчик команды /stats"""
+    await message.answer(
+        format_user_stats(message.from_user.id),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
+            ]]
+        )
+    )
+
+@router.message(Command("search"))
+async def cmd_search(message: Message, state: FSMContext):
+    """Обработчик команды /search"""
+    await message.answer(
+        "🔍 <b>Поиск задач</b>\n\n"
+        "Введите ключевое слово для поиска:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main")
+            ]]
+        )
+    )
+    await state.set_state(TaskStates.searching_tasks)
 
 # ========== ОБРАБОТЧИКИ КНОПОК ==========
 @router.message(F.text == "📝 Создать задачу")
@@ -529,6 +706,11 @@ async def create_task_start(message: Message, state: FSMContext):
 async def show_my_tasks(message: Message):
     """Показать задачи пользователя"""
     await show_user_tasks(message.from_user.id, message.chat.id)
+
+@router.message(F.text == "🔍 Поиск задач")
+async def show_search_tasks(message: Message, state: FSMContext):
+    """Показать поиск задач"""
+    await cmd_search(message, state)
 
 @router.message(F.text == "✅ Выполненные")
 async def show_completed_tasks(message: Message):
@@ -553,6 +735,28 @@ async def show_stats(message: Message):
                 InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
             ]]
         )
+    )
+
+@router.message(F.text == "📂 По категориям")
+async def show_categories(message: Message):
+    """Показать задачи по категориям"""
+    tasks = db.get_user_tasks(message.from_user.id)
+    
+    if not tasks:
+        await message.answer("У вас еще нет задач!")
+        return
+    
+    categories = set(task['category'] for task in tasks)
+    
+    text = "<b>📂 Ваши категории:</b>\n\n"
+    for category in sorted(categories):
+        category_tasks = db.get_tasks_by_category(message.from_user.id, category)
+        completed = len([t for t in category_tasks if t['completed']])
+        text += f"• {category}: {len(category_tasks)} задач ({completed} ✅)\n"
+    
+    await message.answer(
+        text,
+        reply_markup=get_categories_keyboard(message.from_user.id)
     )
 
 @router.message(F.text == "⚙️ Админ-панель")
@@ -584,10 +788,10 @@ async def process_task_text(message: Message, state: FSMContext):
     )
     await state.set_state(TaskStates.waiting_for_category)
 
-@router.callback_query(F.data.startswith("category_"))
+@router.callback_query(F.data.startswith("category_create_"))
 async def process_category(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора категории"""
-    category = callback.data.split("_", 1)[1]
+    """Обработка выбора категории при создании"""
+    category = callback.data.split("_", 2)[2]
     
     if category == "custom":
         await callback.message.edit_text(
@@ -630,10 +834,10 @@ async def process_custom_category(message: Message, state: FSMContext):
     )
     await state.set_state(TaskStates.waiting_for_priority)
 
-@router.callback_query(F.data.startswith("priority_"))
+@router.callback_query(F.data.startswith("priority_create_"))
 async def process_priority(callback: CallbackQuery, state: FSMContext):
     """Обработка выбора приоритета и сохранение задачи"""
-    priority = callback.data.split("_", 1)[1]
+    priority = callback.data.split("_", 2)[2]
     data = await state.get_data()
     
     task_id = db.add_task(
@@ -658,6 +862,34 @@ async def process_priority(callback: CallbackQuery, state: FSMContext):
             ]]
         )
     )
+    
+    await state.clear()
+
+@router.message(TaskStates.searching_tasks)
+async def process_search(message: Message, state: FSMContext):
+    """Обработка поиска задач"""
+    query = message.text.strip()
+    if len(query) < 2:
+        await message.answer("Введите минимум 2 символа для поиска")
+        return
+    
+    tasks = db.search_tasks(message.from_user.id, query)
+    
+    if tasks:
+        await message.answer(
+            f"🔍 <b>Результаты поиска по запросу:</b> '{query}'\n"
+            f"Найдено задач: {len(tasks)}",
+            reply_markup=get_tasks_keyboard(tasks)
+        )
+    else:
+        await message.answer(
+            f"По запросу '{query}' ничего не найдено",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
+                ]]
+            )
+        )
     
     await state.clear()
 
@@ -785,26 +1017,25 @@ async def edit_task_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(task_id=task_id)
     
     await callback.message.edit_text(
-        "✏️ <b>Что вы хотите изменить?</b>",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="📝 Текст", callback_data="edit_text"),
-                    InlineKeyboardButton(text="📂 Категория", callback_data="edit_category")
-                ],
-                [
-                    InlineKeyboardButton(text="🎯 Приоритет", callback_data="edit_priority"),
-                    InlineKeyboardButton(text="🔙 Назад", callback_data=f"task_detail_{task_id}")
-                ]
-            ]
-        )
+        f"✏️ <b>Редактирование задачи #{task_id}</b>\n\n"
+        f"<b>Текущий текст:</b> {task['text']}\n"
+        f"<b>Категория:</b> {task['category']}\n"
+        f"<b>Приоритет:</b> {task['priority']}\n\n"
+        f"Что вы хотите изменить?",
+        reply_markup=get_edit_task_keyboard(task_id)
     )
 
-@router.callback_query(F.data == "edit_text")
-async def edit_task_text(callback: CallbackQuery, state: FSMContext):
-    """Редактирование текста задачи"""
-    data = await state.get_data()
-    task_id = data['task_id']
+@router.callback_query(F.data.startswith("edit_text_"))
+async def edit_task_text_start(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования текста задачи"""
+    task_id = int(callback.data.split("_", 2)[2])
+    task = db.get_task(task_id)
+    
+    if not task or task['user_id'] != callback.from_user.id:
+        await callback.answer("Ошибка!", show_alert=True)
+        return
+    
+    await state.update_data(task_id=task_id)
     
     await callback.message.edit_text(
         "📝 <b>Введите новый текст задачи:</b>",
@@ -821,10 +1052,13 @@ async def process_edit_text(message: Message, state: FSMContext):
     """Обработка нового текста задачи"""
     data = await state.get_data()
     task_id = data['task_id']
-    task = db.get_task(task_id)
     
-    if task and task['user_id'] == message.from_user.id:
-        task['text'] = message.text
+    if len(message.text) > 500:
+        await message.answer("Текст задачи слишком длинный (макс. 500 символов)")
+        return
+    
+    if db.update_task_text(task_id, message.text):
+        task = db.get_task(task_id)
         await message.answer(
             "✅ <b>Текст задачи обновлен!</b>",
             reply_markup=InlineKeyboardMarkup(
@@ -833,7 +1067,148 @@ async def process_edit_text(message: Message, state: FSMContext):
                 ]]
             )
         )
+    else:
+        await message.answer("❌ Ошибка при обновлении задачи")
+    
     await state.clear()
+
+@router.callback_query(F.data.startswith("edit_category_"))
+async def edit_task_category_start(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования категории задачи"""
+    task_id = int(callback.data.split("_", 2)[2])
+    task = db.get_task(task_id)
+    
+    if not task or task['user_id'] != callback.from_user.id:
+        await callback.answer("Ошибка!", show_alert=True)
+        return
+    
+    await state.update_data(task_id=task_id)
+    
+    await callback.message.edit_text(
+        "📂 <b>Выберите новую категорию:</b>",
+        reply_markup=get_category_keyboard("edit")
+    )
+    await state.set_state(TaskStates.editing_category)
+
+@router.callback_query(F.data.startswith("category_edit_"))
+async def process_edit_category(callback: CallbackQuery, state: FSMContext):
+    """Обработка изменения категории задачи"""
+    data = await state.get_data()
+    task_id = data['task_id']
+    
+    if callback.data == "category_edit_custom":
+        await callback.message.edit_text(
+            "✏️ <b>Введите новую категорию:</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Отмена", callback_data=f"task_detail_{task_id}")
+                ]]
+            )
+        )
+        return
+    
+    category = callback.data.split("_", 2)[2]
+    
+    if db.update_task_category(task_id, category):
+        task = db.get_task(task_id)
+        await callback.message.edit_text(
+            "✅ <b>Категория задачи обновлена!</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="📋 К задаче", callback_data=f"task_detail_{task_id}")
+                ]]
+            )
+        )
+    else:
+        await callback.answer("❌ Ошибка при обновлении категории", show_alert=True)
+    
+    await state.clear()
+
+@router.message(TaskStates.editing_category)
+async def process_edit_custom_category(message: Message, state: FSMContext):
+    """Обработка пользовательской категории при редактировании"""
+    data = await state.get_data()
+    task_id = data['task_id']
+    
+    if len(message.text) > 50:
+        await message.answer("Название категории слишком длинное (макс. 50 символов)")
+        return
+    
+    if db.update_task_category(task_id, message.text):
+        task = db.get_task(task_id)
+        await message.answer(
+            "✅ <b>Категория задачи обновлена!</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="📋 К задаче", callback_data=f"task_detail_{task_id}")
+                ]]
+            )
+        )
+    else:
+        await message.answer("❌ Ошибка при обновлении категории")
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith("edit_priority_"))
+async def edit_task_priority_start(callback: CallbackQuery, state: FSMContext):
+    """Начало редактирования приоритета задачи"""
+    task_id = int(callback.data.split("_", 2)[2])
+    task = db.get_task(task_id)
+    
+    if not task or task['user_id'] != callback.from_user.id:
+        await callback.answer("Ошибка!", show_alert=True)
+        return
+    
+    await state.update_data(task_id=task_id)
+    
+    await callback.message.edit_text(
+        "🎯 <b>Выберите новый приоритет:</b>",
+        reply_markup=get_priority_keyboard("edit")
+    )
+    await state.set_state(TaskStates.editing_priority)
+
+@router.callback_query(F.data.startswith("priority_edit_"))
+async def process_edit_priority(callback: CallbackQuery, state: FSMContext):
+    """Обработка изменения приоритета задачи"""
+    data = await state.get_data()
+    task_id = data['task_id']
+    priority = callback.data.split("_", 2)[2]
+    
+    if db.update_task_priority(task_id, priority):
+        task = db.get_task(task_id)
+        await callback.message.edit_text(
+            "✅ <b>Приоритет задачи обновлен!</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="📋 К задаче", callback_data=f"task_detail_{task_id}")
+                ]]
+            )
+        )
+    else:
+        await callback.answer("❌ Ошибка при обновлении приоритета", show_alert=True)
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith("view_category_"))
+async def view_category_tasks(callback: CallbackQuery):
+    """Просмотр задач по категории"""
+    category = callback.data.split("_", 2)[2]
+    tasks = db.get_tasks_by_category(callback.from_user.id, category)
+    
+    if tasks:
+        await callback.message.edit_text(
+            f"<b>📂 Задачи в категории '{category}'</b> (всего: {len(tasks)})",
+            reply_markup=get_tasks_keyboard(tasks)
+        )
+    else:
+        await callback.message.edit_text(
+            f"В категории '{category}' нет задач",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")
+                ]]
+            )
+        )
 
 # ========== АДМИН ОБРАБОТЧИКИ ==========
 @router.callback_query(F.data == "admin_stats")
@@ -924,8 +1299,9 @@ async def admin_users_handler(callback: CallbackQuery):
         active_tasks = len([t for t in user_tasks if not t['completed']])
         
         text += f"{i}. @{user.get('username', 'Без имени')}\n"
+        text += f"   ID: <code>{user['user_id']}</code>\n"
         text += f"   📝 Задач: {len(user_tasks)} | ⏳ Активных: {active_tasks}\n"
-        text += f"   📅 С: {user['joined'].strftime('%d.%m.%Y')}\n\n"
+        text += f"   📅 С: {user['joined'].strftime('%d.%m.%Y %H:%M')}\n\n"
     
     await callback.message.edit_text(
         text,
@@ -987,7 +1363,7 @@ async def admin_message_user_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ запрещен!", show_alert=True)
         return
     
-    user_id = int(callback.data.split("_", 2)[2])
+    user_id = int(callback.data.split("_", 2)[1])
     await state.update_data(target_user_id=user_id)
     
     user = db.users.get(user_id, {})
@@ -1004,6 +1380,52 @@ async def admin_message_user_start(callback: CallbackQuery, state: FSMContext):
         )
     )
     await state.set_state(AdminStates.waiting_user_message)
+
+@router.callback_query(F.data == "admin_message_user")
+async def admin_message_user_general(callback: CallbackQuery, state: FSMContext):
+    """Начало отправки сообщения пользователю (общий)"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "✉️ <b>Отправка сообщения пользователю</b>\n\n"
+        "Введите ID пользователя:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")
+            ]]
+        )
+    )
+    await state.set_state(AdminStates.waiting_user_id)
+
+@router.message(AdminStates.waiting_user_id)
+async def process_user_id(message: Message, state: FSMContext):
+    """Обработка ID пользователя"""
+    try:
+        user_id = int(message.text)
+        user = db.users.get(user_id)
+        
+        if not user:
+            await message.answer("Пользователь с таким ID не найден")
+            return
+        
+        await state.update_data(target_user_id=user_id)
+        
+        await message.answer(
+            f"✉️ <b>Отправка сообщения пользователю</b>\n\n"
+            f"Пользователь: @{user.get('username', 'Неизвестно')}\n"
+            f"ID: <code>{user_id}</code>\n\n"
+            f"Введите ваше сообщение:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")
+                ]]
+            )
+        )
+        await state.set_state(AdminStates.waiting_user_message)
+    except ValueError:
+        await message.answer("❌ Неверный формат ID. Введите числовой ID пользователя.")
 
 @router.message(AdminStates.waiting_user_message)
 async def process_admin_message(message: Message, state: FSMContext):
@@ -1023,6 +1445,145 @@ async def process_admin_message(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(
             f"❌ Не удалось отправить сообщение: {str(e)}",
+            reply_markup=get_admin_keyboard()
+        )
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith("admin_delete_task_"))
+async def admin_delete_task(callback: CallbackQuery):
+    """Удаление задачи админом"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    task_id = int(callback.data.split("_", 3)[3])
+    
+    if db.delete_task(task_id):
+        await callback.message.edit_text(
+            "✅ <b>Задача удалена администратором</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="🔙 Назад", callback_data="admin_tasks")
+                ]]
+            )
+        )
+        await callback.answer("Задача удалена")
+    else:
+        await callback.answer("Ошибка удаления!", show_alert=True)
+
+@router.callback_query(F.data == "admin_export")
+async def admin_export_start(callback: CallbackQuery, state: FSMContext):
+    """Начало экспорта данных"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "📁 <b>Экспорт данных</b>\n\n"
+        "Выберите формат экспорта:",
+        reply_markup=get_export_keyboard()
+    )
+    await state.set_state(AdminStates.waiting_export_format)
+
+@router.callback_query(F.data.startswith("export_"))
+async def process_export(callback: CallbackQuery, state: FSMContext):
+    """Обработка экспорта данных"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+    
+    export_format = callback.data.split("_", 1)[1]
+    
+    await callback.answer(f"Начинаю экспорт в формате {export_format.upper()}...", show_alert=True)
+    
+    # Подготовка данных
+    data = {
+        "users": db.get_all_users(),
+        "tasks": db.get_all_tasks(),
+        "stats": db.admin_stats,
+        "export_date": datetime.now().isoformat()
+    }
+    
+    # Экспорт в разных форматах
+    try:
+        if export_format == "json":
+            filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+            
+            await bot.send_document(
+                callback.from_user.id,
+                FSInputFile(filename),
+                caption="📁 Экспорт данных в формате JSON"
+            )
+            
+        elif export_format == "txt":
+            filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("=" * 50 + "\n")
+                f.write("ЭКСПОРТ ДАННЫХ ИЗ БОТА\n")
+                f.write(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n")
+                f.write("=" * 50 + "\n\n")
+                
+                f.write("ПОЛЬЗОВАТЕЛИ:\n")
+                f.write("=" * 30 + "\n")
+                for user in data['users']:
+                    f.write(f"ID: {user['user_id']}\n")
+                    f.write(f"Имя: {user['full_name']}\n")
+                    f.write(f"Username: @{user.get('username', 'нет')}\n")
+                    f.write(f"Дата регистрации: {user['joined'].strftime('%d.%m.%Y %H:%M')}\n")
+                    f.write(f"Задач создано: {user['task_count']}\n")
+                    f.write(f"Задач выполнено: {user['completed_count']}\n")
+                    f.write("-" * 30 + "\n")
+                
+                f.write("\nЗАДАЧИ:\n")
+                f.write("=" * 30 + "\n")
+                for task in data['tasks']:
+                    f.write(f"ID: {task['id']}\n")
+                    f.write(f"Пользователь ID: {task['user_id']}\n")
+                    f.write(f"Текст: {task['text']}\n")
+                    f.write(f"Категория: {task['category']}\n")
+                    f.write(f"Приоритет: {task['priority']}\n")
+                    f.write(f"Статус: {'Выполнена' if task['completed'] else 'В работе'}\n")
+                    f.write(f"Создана: {task['created'].strftime('%d.%m.%Y %H:%M')}\n")
+                    if task['completed_at']:
+                        f.write(f"Выполнена: {task['completed_at'].strftime('%d.%m.%Y %H:%M')}\n")
+                    f.write("-" * 30 + "\n")
+            
+            await bot.send_document(
+                callback.from_user.id,
+                FSInputFile(filename),
+                caption="📄 Экспорт данных в формате TXT"
+            )
+            
+        elif export_format == "csv":
+            filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            with open(filename, 'w', encoding='utf-8') as f:
+                # Заголовок для задач
+                f.write("ID;UserID;Text;Category;Priority;Completed;Created;CompletedAt\n")
+                for task in data['tasks']:
+                    completed_at = task['completed_at'].strftime('%Y-%m-%d %H:%M') if task['completed_at'] else ''
+                    f.write(f"{task['id']};{task['user_id']};{task['text']};"
+                           f"{task['category']};{task['priority']};"
+                           f"{'Да' if task['completed'] else 'Нет'};"
+                           f"{task['created'].strftime('%Y-%m-%d %H:%M')};{completed_at}\n")
+            
+            await bot.send_document(
+                callback.from_user.id,
+                FSInputFile(filename),
+                caption="📊 Экспорт данных в формате CSV"
+            )
+        
+        await callback.message.edit_text(
+            "✅ <b>Экспорт данных завершен</b>\n\n"
+            "Файл с данными отправлен вам в личные сообщения.",
+            reply_markup=get_admin_keyboard()
+        )
+        
+    except Exception as e:
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка при экспорте данных:</b>\n\n{str(e)}",
             reply_markup=get_admin_keyboard()
         )
     
@@ -1074,18 +1635,15 @@ async def cancel_creation(callback: CallbackQuery, state: FSMContext):
         )
     )
 
-@router.callback_query(F.data == "cancel_edit")
-async def cancel_edit(callback: CallbackQuery, state: FSMContext):
-    """Отмена редактирования"""
-    await state.clear()
-    await callback.message.edit_text(
-        "❌ Редактирование отменено",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(text="📋 Главное меню", callback_data="back_to_main")
-            ]]
-        )
-    )
+@router.callback_query(F.data == "create_task_from_empty")
+async def create_task_from_empty(callback: CallbackQuery):
+    """Создать задачу из пустого списка"""
+    await create_task_start(callback.message, callback.state)
+
+@router.callback_query(F.data == "create_another")
+async def create_another_task(callback: CallbackQuery, state: FSMContext):
+    """Создать еще одну задачу"""
+    await create_task_start(callback.message, state)
 
 # ========== ДОПОЛНИТЕЛЬНЫЕ ОБРАБОТЧИКИ ==========
 @router.callback_query(F.data.startswith("tasks_page_"))
@@ -1104,11 +1662,6 @@ async def change_admin_tasks_page(callback: CallbackQuery):
         f"<b>📋 Все задачи в системе</b> (всего: {len(tasks)})",
         reply_markup=get_admin_tasks_keyboard(tasks, page)
     )
-
-@router.callback_query(F.data == "create_another")
-async def create_another_task(callback: CallbackQuery, state: FSMContext):
-    """Создать еще одну задачу"""
-    await create_task_start(callback.message, state)
 
 # ========== ЗАПУСК БОТА ==========
 async def main():
