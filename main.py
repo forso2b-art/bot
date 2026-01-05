@@ -1,10 +1,11 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.filters import Command, StateFilter
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -31,14 +32,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=BOT_TOKEN, 
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
 # ========== БАЗА ДАННЫХ (В ПАМЯТИ ДЛЯ ПРИМЕРА) ==========
-# В реальном проекте используйте PostgreSQL/SQLite
 class Database:
     def __init__(self):
         self.users: Dict[int, Dict] = {}
@@ -53,6 +56,7 @@ class Database:
     def add_user(self, user_id: int, username: str, full_name: str):
         if user_id not in self.users:
             self.users[user_id] = {
+                'user_id': user_id,
                 'username': username,
                 'full_name': full_name,
                 'joined': datetime.now(),
@@ -73,7 +77,9 @@ class Database:
             'priority': 'medium'
         }
         
-        self.users[user_id]['task_count'] += 1
+        if user_id in self.users:
+            self.users[user_id]['task_count'] += 1
+        
         self.admin_stats['total_tasks'] += 1
         self.admin_stats['active_users'].add(user_id)
         
@@ -98,10 +104,12 @@ class Database:
             
             user_id = task['user_id']
             if task['completed']:
-                self.users[user_id]['completed_count'] += 1
+                if user_id in self.users:
+                    self.users[user_id]['completed_count'] += 1
                 self.admin_stats['completed_tasks'] += 1
             else:
-                self.users[user_id]['completed_count'] -= 1
+                if user_id in self.users:
+                    self.users[user_id]['completed_count'] -= 1
                 self.admin_stats['completed_tasks'] -= 1
             
             return True
@@ -111,13 +119,15 @@ class Database:
         task = self.tasks.get(task_id)
         if task:
             user_id = task['user_id']
-            self.users[user_id]['task_count'] -= 1
-            if task['completed']:
-                self.users[user_id]['completed_count'] -= 1
-                self.admin_stats['completed_tasks'] -= 1
+            if user_id in self.users:
+                self.users[user_id]['task_count'] -= 1
+                if task['completed']:
+                    self.users[user_id]['completed_count'] -= 1
             
             del self.tasks[task_id]
             self.admin_stats['total_tasks'] -= 1
+            if task['completed']:
+                self.admin_stats['completed_tasks'] -= 1
             return True
         return False
     
@@ -126,6 +136,20 @@ class Database:
     
     def get_all_users(self) -> List[Dict]:
         return list(self.users.values())
+    
+    def update_task_priority(self, task_id: int, priority: str) -> bool:
+        task = self.tasks.get(task_id)
+        if task:
+            task['priority'] = priority
+            return True
+        return False
+    
+    def update_task_category(self, task_id: int, category: str) -> bool:
+        task = self.tasks.get(task_id)
+        if task:
+            task['category'] = category
+            return True
+        return False
 
 db = Database()
 
@@ -177,21 +201,27 @@ def get_tasks_keyboard(tasks: List[Dict], page: int = 0, tasks_per_page: int = 5
         ))
     
     # Навигация
+    navigation_buttons = []
+    
     if page > 0:
-        builder.row(
-            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tasks_page_{page-1}"),
-            InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu"),
-            InlineKeyboardButton(text="Вперед ➡️", callback_data=f"tasks_page_{page+1}"),
-            width=3
-        )
-    elif len(tasks) > end_idx:
-        builder.row(
-            InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu"),
-            InlineKeyboardButton(text="Вперед ➡️", callback_data=f"tasks_page_{page+1}"),
-            width=2
-        )
-    else:
-        builder.row(InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu"))
+        navigation_buttons.append(InlineKeyboardButton(
+            text="⬅️ Назад", 
+            callback_data=f"tasks_page_{page-1}"
+        ))
+    
+    navigation_buttons.append(InlineKeyboardButton(
+        text="❌ Закрыть", 
+        callback_data="close_menu"
+    ))
+    
+    if len(tasks) > end_idx:
+        navigation_buttons.append(InlineKeyboardButton(
+            text="Вперед ➡️", 
+            callback_data=f"tasks_page_{page+1}"
+        ))
+    
+    if navigation_buttons:
+        builder.row(*navigation_buttons)
     
     return builder.as_markup()
 
@@ -366,6 +396,7 @@ def format_task(task: Dict) -> str:
 <b>Создана:</b> {created}
 <b>Выполнена:</b> {completed}
 <b>Автор:</b> @{username}"""
+
 def format_user_stats(user_id: int) -> str:
     """Форматирование статистики пользователя"""
     user = db.users.get(user_id, {})
@@ -373,7 +404,9 @@ def format_user_stats(user_id: int) -> str:
     active_tasks = [t for t in tasks if not t['completed']]
     completed_tasks = [t for t in tasks if t['completed']]
     
-    return f"""<b>📊 Ваша статистика</b>
+    if tasks:
+        progress = (len(completed_tasks) / len(tasks) * 100) if tasks else 0
+        return f"""<b>📊 Ваша статистика</b>
 
 👤 <b>Пользователь:</b> @{user.get('username', 'Без имени')}
 📅 <b>С нами с:</b> {user.get('joined').strftime('%d.%m.%Y') if user.get('joined') else 'Неизвестно'}
@@ -382,7 +415,9 @@ def format_user_stats(user_id: int) -> str:
 📝 Всего задач: {len(tasks)}
 ✅ Выполнено: {len(completed_tasks)}
 ⏳ В работе: {len(active_tasks)}
-🎯 Прогресс: {len(completed_tasks)/len(tasks)*100:.1f}%""" if tasks else "Создайте первую задачу, чтобы увидеть статистику!"
+🎯 Прогресс: {progress:.1f}%"""
+    else:
+        return "Создайте первую задачу, чтобы увидеть статистику!"
 
 def format_admin_stats() -> str:
     """Форматирование статистики для админа"""
@@ -608,9 +643,7 @@ async def process_priority(callback: CallbackQuery, state: FSMContext):
     )
     
     # Обновляем приоритет
-    task = db.get_task(task_id)
-    if task:
-        task['priority'] = priority
+    db.update_task_priority(task_id, priority)
     
     await callback.message.edit_text(
         f"✅ <b>Задача создана!</b>\n\n"
@@ -770,11 +803,14 @@ async def edit_task_start(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "edit_text")
 async def edit_task_text(callback: CallbackQuery, state: FSMContext):
     """Редактирование текста задачи"""
+    data = await state.get_data()
+    task_id = data['task_id']
+    
     await callback.message.edit_text(
         "📝 <b>Введите новый текст задачи:</b>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"task_detail_{task_id}")
             ]]
         )
     )
@@ -887,7 +923,7 @@ async def admin_users_handler(callback: CallbackQuery):
         user_tasks = db.get_user_tasks(user['user_id'])
         active_tasks = len([t for t in user_tasks if not t['completed']])
         
-        text += f"{i}. @{user['username']}\n"
+        text += f"{i}. @{user.get('username', 'Без имени')}\n"
         text += f"   📝 Задач: {len(user_tasks)} | ⏳ Активных: {active_tasks}\n"
         text += f"   📅 С: {user['joined'].strftime('%d.%m.%Y')}\n\n"
     
@@ -999,15 +1035,7 @@ async def back_to_main(callback: CallbackQuery):
     await callback.message.edit_text(
         "<b>📋 Главное меню</b>\n\n"
         "Выберите действие:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(text="📝 Создать задачу", callback_data="create_task"),
-                InlineKeyboardButton(text="📋 Мои задачи", callback_data="show_tasks")
-            ], [
-                InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats"),
-                InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")
-            ]]
-        )
+        reply_markup=get_main_keyboard(callback.from_user.id)
     )
 
 @router.callback_query(F.data == "back_to_tasks")
@@ -1058,6 +1086,29 @@ async def cancel_edit(callback: CallbackQuery, state: FSMContext):
             ]]
         )
     )
+
+# ========== ДОПОЛНИТЕЛЬНЫЕ ОБРАБОТЧИКИ ==========
+@router.callback_query(F.data.startswith("tasks_page_"))
+async def change_tasks_page(callback: CallbackQuery):
+    """Смена страницы задач"""
+    page = int(callback.data.split("_", 2)[2])
+    await show_user_tasks(callback.from_user.id, callback.message.chat.id, page)
+
+@router.callback_query(F.data.startswith("admin_tasks_page_"))
+async def change_admin_tasks_page(callback: CallbackQuery):
+    """Смена страницы админских задач"""
+    page = int(callback.data.split("_", 3)[3])
+    tasks = db.get_all_tasks()
+    
+    await callback.message.edit_text(
+        f"<b>📋 Все задачи в системе</b> (всего: {len(tasks)})",
+        reply_markup=get_admin_tasks_keyboard(tasks, page)
+    )
+
+@router.callback_query(F.data == "create_another")
+async def create_another_task(callback: CallbackQuery, state: FSMContext):
+    """Создать еще одну задачу"""
+    await create_task_start(callback.message, state)
 
 # ========== ЗАПУСК БОТА ==========
 async def main():
