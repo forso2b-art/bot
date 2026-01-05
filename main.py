@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import json
-from datetime import datetime
+import os
+import re
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -26,6 +28,17 @@ from aiogram.enums import ParseMode
 BOT_TOKEN = "8193091744:AAHjUopkLIBC5zuP4swtDkFKaFUeVqqnoEc"
 CREATOR_ID = 103161998
 ADMIN_IDS = {37607526, 103161998}  # Изначальные админы
+
+# Файл для сохранения ролей/банов (переживает перезапуск)
+STATE_FILE = "bot_security_state.json"
+
+# Поведение при бане: удалять ли задачи пользователя (оставлено True, чтобы не менять текущую логику)
+PURGE_TASKS_ON_BAN = True
+
+# Предупреждения и автобан (новое)
+WARN_LIMIT = 3
+AUTO_BAN_HOURS = 24
+
 
 # ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -58,16 +71,25 @@ class Database:
             'users_today': set()
         }
         
-        # Система ролей и банов
+                # Система ролей и банов
         self.roles: Dict[int, str] = {}  # user_id -> role (creator/admin/user)
-        self.banned_users: Set[int] = set()  # Забаненные пользователи
-        
-        # Инициализация создателя
+        self.banned_users: Set[int] = set()  # Забаненные пользователи (для быстрого подсчета/экспорта)
+        self.ban_info: Dict[int, Dict] = {}  # user_id -> {reason, by, at, until}
+        self.user_warnings: Dict[int, int] = {}  # user_id -> warnings
+        self.ban_history: List[Dict] = []  # аудит банов/разбанов
+        self.security_state_file = STATE_FILE
+
+        # Инициализация создателя (и подгрузка состояния)
         self.roles[CREATOR_ID] = 'creator'
+        self._load_security_state()
+        # Страхуемся от "самобана" / переопределения роли создателя
+        self.roles[CREATOR_ID] = 'creator'
+        self.ban_info.pop(CREATOR_ID, None)
+        self.banned_users.discard(CREATOR_ID)
     
     def add_user(self, user_id: int, username: str, full_name: str):
         """Добавление пользователя с проверкой на бан"""
-        if user_id in self.banned_users:
+        if self.is_banned(user_id):
             return False
         
         if user_id not in self.users:
@@ -79,7 +101,7 @@ class Database:
                 'task_count': 0,
                 'completed_count': 0,
                 'last_active': datetime.now(),
-                'warnings': 0  # Количество предупреждений
+                'warnings': self.user_warnings.get(user_id, 0)  # Количество предупреждений
             }
             
             # Установка роли по умолчанию
@@ -98,81 +120,247 @@ class Database:
         return self.roles.get(user_id, 'user')
     
     def is_banned(self, user_id: int) -> bool:
-        """Проверка, забанен ли пользователь"""
-        return user_id in self.banned_users
-    
-    def ban_user(self, user_id: int, reason: str = "Нарушение правил") -> bool:
-        """Бан пользователя"""
-        if user_id == CREATOR_ID:
-            return False  # Нельзя забанить создателя
-        
-        # Проверяем права того, кто банит
-        # Только создатель может банить админов
-        if self.get_user_role(user_id) == 'admin':
-            # Для бана админа нужен создатель
+        """Проверка, забанен ли пользователь (с учетом временных банов)"""
+        info = self.ban_info.get(user_id)
+        if not info:
             return False
-        
-        self.banned_users.add(user_id)
-        
-        # Удаляем все задачи забаненного пользователя
-        task_ids_to_delete = []
-        for task_id, task in self.tasks.items():
-            if task['user_id'] == user_id:
-                task_ids_to_delete.append(task_id)
-        
-        for task_id in task_ids_to_delete:
-            self.delete_task(task_id)
-        
-        # Удаляем из статистики
-        if user_id in self.admin_stats['active_users']:
-            self.admin_stats['active_users'].remove(user_id)
-        if user_id in self.admin_stats['users_today']:
-            self.admin_stats['users_today'].remove(user_id)
-        
-        logger.info(f"User {user_id} banned. Reason: {reason}")
+
+        until = info.get("until")
+        if until and datetime.now() >= until:
+            # Бан истек — снимаем автоматически
+            self.ban_info.pop(user_id, None)
+            self.banned_users.discard(user_id)
+            self._save_security_state()
+            return False
+
         return True
     
-    def unban_user(self, user_id: int) -> bool:
+
+    def can_unban_user(self, manager_id: int, target_id: int) -> bool:
+        """Проверка прав на разбан пользователя (логика совпадает с can_ban_user)"""
+        return self.can_ban_user(manager_id, target_id)
+
+    def get_ban_info(self, user_id: int) -> Optional[Dict]:
+        """Получить информацию о бане (reason/by/at/until)."""
+        info = self.ban_info.get(user_id)
+        if not info:
+            return None
+        # Актуализируем (на случай истекшего временного бана)
+        return info if self.is_banned(user_id) else None
+
+    def ban_user(
+        self,
+        manager_id: int,
+        target_id: int,
+        reason: str = "Нарушение правил",
+        duration_seconds: Optional[int] = None,
+        purge_tasks: Optional[bool] = None
+    ) -> bool:
+        """Бан пользователя.
+
+        duration_seconds:
+            • None -> бессрочно
+            • int  -> временный бан (в секундах)
+
+        purge_tasks:
+            • None -> берется из PURGE_TASKS_ON_BAN
+            • bool -> принудительно
+        """
+        if target_id == CREATOR_ID:
+            return False  # Нельзя банить создателя
+
+        if not self.can_ban_user(manager_id, target_id):
+            return False
+
+        if purge_tasks is None:
+            purge_tasks = PURGE_TASKS_ON_BAN
+
+        now = datetime.now()
+        until = (now + timedelta(seconds=duration_seconds)) if duration_seconds else None
+
+        self.banned_users.add(target_id)
+        self.ban_info[target_id] = {
+            "reason": reason,
+            "by": manager_id,
+            "at": now,
+            "until": until,
+        }
+
+        # Удаляем задачи забаненного пользователя (если включено)
+        if purge_tasks:
+            task_ids_to_delete = [tid for tid, task in self.tasks.items() if task['user_id'] == target_id]
+            for task_id in task_ids_to_delete:
+                self.delete_task(task_id)
+
+        # Удаляем из статистики
+        self.admin_stats['active_users'].discard(target_id)
+        self.admin_stats['users_today'].discard(target_id)
+
+        # Журнал действий (не обязателен, но удобен для аудита)
+        if not hasattr(self, "ban_history"):
+            self.ban_history: List[Dict] = []
+        self.ban_history.append({
+            "action": "ban",
+            "user_id": target_id,
+            "by": manager_id,
+            "reason": reason,
+            "at": now.isoformat(),
+            "until": until.isoformat() if until else None,
+        })
+
+        self._save_security_state()
+        logger.info(f"User {target_id} banned by {manager_id}. Reason: {reason}. Until: {until}")
+        return True
+
+    def unban_user(self, manager_id: int, target_id: int, note: str = "") -> bool:
         """Разбан пользователя"""
-        if user_id in self.banned_users:
-            self.banned_users.remove(user_id)
-            logger.info(f"User {user_id} unbanned")
+        if not self.can_unban_user(manager_id, target_id):
+            return False
+
+        if target_id in self.ban_info or target_id in self.banned_users:
+            self.ban_info.pop(target_id, None)
+            self.banned_users.discard(target_id)
+
+            if not hasattr(self, "ban_history"):
+                self.ban_history: List[Dict] = []
+            self.ban_history.append({
+                "action": "unban",
+                "user_id": target_id,
+                "by": manager_id,
+                "note": note,
+                "at": datetime.now().isoformat(),
+            })
+
+            self._save_security_state()
+            logger.info(f"User {target_id} unbanned by {manager_id}")
             return True
         return False
-    
+
+    def warn_user(self, manager_id: int, target_id: int, reason: str = "") -> int:
+        """Выдать предупреждение. Возвращает текущее число предупреждений.
+
+        При достижении WARN_LIMIT — автоматически банит на AUTO_BAN_HOURS (без удаления задач).
+        """
+        if not self.can_manage_user(manager_id, target_id):
+            return self.user_warnings.get(target_id, 0)
+
+        current = self.user_warnings.get(target_id, 0) + 1
+        self.user_warnings[target_id] = current
+        if target_id in self.users:
+            self.users[target_id]['warnings'] = current
+
+        if current >= WARN_LIMIT:
+            # Сбрасываем предупреждения и выдаем временный бан
+            self.user_warnings[target_id] = 0
+            if target_id in self.users:
+                self.users[target_id]['warnings'] = 0
+            self.ban_user(
+                manager_id,
+                target_id,
+                reason=reason or f"Автобан после {WARN_LIMIT} предупреждений",
+                duration_seconds=AUTO_BAN_HOURS * 3600,
+                purge_tasks=False
+            )
+
+        self._save_security_state()
+        return self.user_warnings.get(target_id, 0)
+
+    def clear_warnings(self, manager_id: int, target_id: int) -> bool:
+        """Сброс предупреждений"""
+        if not self.can_manage_user(manager_id, target_id):
+            return False
+        self.user_warnings[target_id] = 0
+        if target_id in self.users:
+            self.users[target_id]['warnings'] = 0
+        self._save_security_state()
+        return True
+
+    def _save_security_state(self) -> None:
+        """Сохранение ролей/банов/предупреждений в файл (переживает перезапуск)."""
+        try:
+            data = {
+                "roles": {str(k): v for k, v in self.roles.items()},
+                "bans": {
+                    str(uid): {
+                        "reason": info.get("reason", ""),
+                        "by": info.get("by"),
+                        "at": info.get("at").isoformat() if info.get("at") else None,
+                        "until": info.get("until").isoformat() if info.get("until") else None,
+                    } for uid, info in self.ban_info.items()
+                },
+                "warnings": {str(k): int(v) for k, v in self.user_warnings.items()},
+                "saved_at": datetime.now().isoformat(),
+            }
+            with open(self.security_state_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.exception(f"Failed to save security state: {e}")
+
+    def _load_security_state(self) -> None:
+        """Загрузка ролей/банов/предупреждений из файла."""
+        try:
+            if not os.path.exists(self.security_state_file):
+                return
+            with open(self.security_state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            roles = data.get("roles", {})
+            self.roles.update({int(k): v for k, v in roles.items()})
+
+            bans = data.get("bans", {})
+            for k, info in bans.items():
+                uid = int(k)
+                at = info.get("at")
+                until = info.get("until")
+                self.ban_info[uid] = {
+                    "reason": info.get("reason", ""),
+                    "by": info.get("by"),
+                    "at": datetime.fromisoformat(at) if at else None,
+                    "until": datetime.fromisoformat(until) if until else None,
+                }
+                self.banned_users.add(uid)
+
+            warnings = data.get("warnings", {})
+            self.user_warnings.update({int(k): int(v) for k, v in warnings.items()})
+        except Exception as e:
+            logger.exception(f"Failed to load security state: {e}")
+
+
     def set_admin(self, user_id: int) -> bool:
         """Назначение пользователя админом"""
         if user_id == CREATOR_ID:
             return False  # Создатель уже выше админа
-        
+
         if self.is_banned(user_id):
             return False
-        
+
         self.roles[user_id] = 'admin'
-        
+
         # Добавляем в список админов если нужно
         if user_id not in ADMIN_IDS:
             ADMIN_IDS.add(user_id)
-        
+
+        self._save_security_state()
         logger.info(f"User {user_id} promoted to admin")
         return True
-    
+
     def remove_admin(self, user_id: int) -> bool:
         """Снятие пользователя с админки"""
         if user_id == CREATOR_ID:
             return False  # Нельзя снять создателя
-        
+
         if self.get_user_role(user_id) == 'admin':
             self.roles[user_id] = 'user'
-            
+
             # Удаляем из списка админов если нужно
             if user_id in ADMIN_IDS:
                 ADMIN_IDS.remove(user_id)
-            
+
+            self._save_security_state()
             logger.info(f"User {user_id} demoted from admin")
             return True
         return False
-    
+
     def can_manage_user(self, manager_id: int, target_id: int) -> bool:
         """Проверка прав на управление пользователем"""
         manager_role = self.get_user_role(manager_id)
@@ -429,6 +617,10 @@ def get_admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
             callback_data="admin_unban_user"
         ))
         builder.add(InlineKeyboardButton(
+            text="🚫 Список банов",
+            callback_data="admin_bans"
+        ))
+        builder.add(InlineKeyboardButton(
             text="📋 Список админов",
             callback_data="admin_list_admins"
         ))
@@ -441,6 +633,14 @@ def get_admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
             text="🚫 Бан пользователя",
             callback_data="admin_ban_user"
         ))
+        builder.add(InlineKeyboardButton(
+            text="✅ Разбан пользователя",
+            callback_data="admin_unban_user"
+        ))
+        builder.add(InlineKeyboardButton(
+            text="🚫 Список банов",
+            callback_data="admin_bans"
+        ))
     
     builder.add(InlineKeyboardButton(
         text="🔙 Главное меню",
@@ -449,9 +649,9 @@ def get_admin_keyboard(user_id: int) -> InlineKeyboardMarkup:
     
     # Настраиваем расположение кнопок
     if user_role == 'creator':
-        builder.adjust(2, 2, 2, 2, 1)
+        builder.adjust(2, 2, 2, 2, 2, 2, 1)
     elif user_role == 'admin':
-        builder.adjust(2, 2, 2, 1)
+        builder.adjust(2, 2, 2, 2, 2, 1)
     else:
         builder.adjust(2, 1)
     
@@ -731,6 +931,36 @@ def get_user_list_keyboard(users: List[Dict], page: int = 0, users_per_page: int
     
     return builder.as_markup()
 
+
+def get_ban_list_keyboard(banned_ids: List[int], page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+    """Клавиатура для списка забаненных пользователей"""
+    builder = InlineKeyboardBuilder()
+
+    start_idx = page * per_page
+    end_idx = start_idx + per_page
+    page_ids = banned_ids[start_idx:end_idx]
+
+    for uid in page_ids:
+        user = db.users.get(uid, {})
+        username = user.get('username')
+        name = user.get('full_name')
+        label = f"🚫 @{username}" if username else f"🚫 {name}" if name else f"🚫 ID {uid}"
+        builder.add(InlineKeyboardButton(text=label, callback_data=f"admin_baninfo_{uid}"))
+
+    # Навигация
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_bans_page_{page-1}"))
+    if end_idx < len(banned_ids):
+        nav.append(InlineKeyboardButton(text="➡️ Вперёд", callback_data=f"admin_bans_page_{page+1}"))
+    if nav:
+        builder.row(*nav)
+
+    builder.add(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back"))
+
+    builder.adjust(1)
+    return builder.as_markup()
+
 def get_user_management_keyboard(user_id: int, manager_id: int) -> InlineKeyboardMarkup:
     """Клавиатура для управления конкретным пользователем"""
     builder = InlineKeyboardBuilder()
@@ -769,7 +999,12 @@ def get_user_management_keyboard(user_id: int, manager_id: int) -> InlineKeyboar
             callback_data=f"admin_promote_user_{user_id}"
         ))
         
-        if not is_banned:
+        if is_banned:
+            builder.add(InlineKeyboardButton(
+                text="✅ Разбанить",
+                callback_data=f"admin_unban_user_{user_id}"
+            ))
+        else:
             builder.add(InlineKeyboardButton(
                 text="🚫 Забанить",
                 callback_data=f"admin_ban_user_{user_id}"
@@ -911,17 +1146,27 @@ def format_user_detail(user_id: int) -> str:
     user = db.users.get(user_id, {})
     if not user:
         return "Пользователь не найден"
-    
+
     role = db.get_user_role(user_id)
     is_banned = db.is_banned(user_id)
-    
+
     role_text = "👑 Создатель" if role == 'creator' else "⚡ Администратор" if role == 'admin' else "👤 Пользователь"
     ban_status = "🚫 <b>Заблокирован</b>" if is_banned else "✅ <b>Активен</b>"
-    
+
+    ban_extra = ""
+    if is_banned:
+        info = db.get_ban_info(user_id) or {}
+        reason = info.get("reason") or "Не указана"
+        until = info.get("until")
+        until_text = "бессрочно" if not until else until.strftime('%d.%m.%Y %H:%M')
+        ban_extra = f"\n<b>Причина бана:</b> {reason}\n<b>Срок бана:</b> {until_text}"
+
+    warnings = user.get('warnings', 0)
+
     tasks = db.get_user_tasks(user_id)
     active_tasks = len([t for t in tasks if not t['completed']])
     completed_tasks = len([t for t in tasks if t['completed']])
-    
+
     return f"""<b>👤 Информация о пользователе</b>
 
 <b>Имя:</b> {user.get('full_name', 'Не указано')}
@@ -929,6 +1174,7 @@ def format_user_detail(user_id: int) -> str:
 <b>ID:</b> <code>{user_id}</code>
 <b>Роль:</b> {role_text}
 <b>Статус:</b> {ban_status}
+<b>⚠️ Предупреждения:</b> {warnings}{ban_extra}
 
 <b>📊 Активность:</b>
 📅 Регистрация: {user.get('joined').strftime('%d.%m.%Y %H:%M') if user.get('joined') else 'Неизвестно'}
@@ -948,10 +1194,17 @@ async def ban_check_middleware(handler, event, data):
     
     # Проверяем, не забанен ли пользователь
     if db.is_banned(user_id):
+        info = db.get_ban_info(user_id) or {}
+        reason = info.get("reason") or "Не указана"
+        until = info.get("until")
+        until_text = "бессрочно" if not until else until.strftime('%d.%m.%Y %H:%M')
+        extra = f"\n\n<b>Причина:</b> {reason}\n<b>Срок:</b> {until_text}"
+
         if isinstance(event, Message):
             await event.answer(
                 "🚫 <b>Ваш аккаунт заблокирован!</b>\n\n"
-                "Вы не можете использовать бота.\n"
+                "Вы не можете использовать бота."
+                f"{extra}\n\n"
                 "Обратитесь к администратору для разблокировки.",
                 reply_markup=None
             )
@@ -967,8 +1220,13 @@ async def ban_check_callback_middleware(handler, event, data):
     
     # Проверяем, не забанен ли пользователь
     if db.is_banned(user_id):
+        info = db.get_ban_info(user_id) or {}
+        reason = info.get("reason") or "Не указана"
+        until = info.get("until")
+        until_text = "бессрочно" if not until else until.strftime('%d.%m.%Y %H:%M')
+
         await event.answer(
-            "🚫 Ваш аккаунт заблокирован!",
+            f"🚫 Ваш аккаунт заблокирован!\nПричина: {reason}\nСрок: {until_text}",
             show_alert=True
         )
         return  # Прерываем обработку
@@ -1060,6 +1318,228 @@ async def cmd_help(message: Message):
 • Помечайте важные задачи высоким приоритетом"""
     
     await message.answer(help_text)
+
+
+# ========== АДМИНСКИЕ КОМАНДЫ (новое) ==========
+def _parse_duration_to_seconds(raw: str) -> Optional[int]:
+    """Парсинг длительности: 30m / 2h / 1d / 15s -> секунды."""
+    raw = (raw or "").strip().lower()
+    m = re.fullmatch(r"(\d+)([smhd])", raw)
+    if not m:
+        return None
+    value = int(m.group(1))
+    unit = m.group(2)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return value * mult
+
+def _fmt_until(until: Optional[datetime]) -> str:
+    return "бессрочно" if not until else until.strftime('%d.%m.%Y %H:%M')
+
+def _is_admin_or_creator(user_id: int) -> bool:
+    return db.get_user_role(user_id) in ['admin', 'creator']
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    """/ban <id> [reason] или ответом на сообщение"""
+    manager_id = message.from_user.id
+    if not _is_admin_or_creator(manager_id):
+        return
+
+    target_id = None
+    reason = "Нарушение правил"
+
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+        reason = (message.text or "").split(maxsplit=1)[1].strip() if len((message.text or "").split(maxsplit=1)) > 1 else reason
+    else:
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 2:
+            await message.answer("Использование: /ban <user_id> [причина] (или ответом на сообщение)")
+            return
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await message.answer("ID должен быть числом.")
+            return
+        if len(parts) >= 3:
+            reason = parts[2].strip() or reason
+
+    if target_id is None:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    if not db.can_ban_user(manager_id, target_id):
+        await message.answer("❌ У вас нет прав, чтобы банить этого пользователя.")
+        return
+
+    if db.ban_user(manager_id, target_id, reason=reason):
+        await message.answer(f"✅ Пользователь <code>{target_id}</code> заблокирован.\nПричина: {reason}")
+        try:
+            await bot.send_message(
+                target_id,
+                "🚫 <b>Ваш аккаунт заблокирован!</b>\n\n"
+                f"<b>Причина:</b> {reason}\n"
+                "<b>Срок:</b> бессрочно"
+            )
+        except:
+            pass
+    else:
+        await message.answer("❌ Не удалось заблокировать пользователя.")
+
+@router.message(Command("tban"))
+async def cmd_tban(message: Message):
+    """/tban <id> <duration: 30m|2h|1d> [reason]"""
+    manager_id = message.from_user.id
+    if not _is_admin_or_creator(manager_id):
+        return
+
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer("Использование: /tban <user_id> <30m|2h|1d> [причина]")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    duration = _parse_duration_to_seconds(parts[2])
+    if not duration:
+        await message.answer("Неверная длительность. Примеры: 30m, 2h, 1d")
+        return
+
+    reason = parts[3].strip() if len(parts) >= 4 else "Временная блокировка"
+
+    if not db.can_ban_user(manager_id, target_id):
+        await message.answer("❌ У вас нет прав, чтобы банить этого пользователя.")
+        return
+
+    if db.ban_user(manager_id, target_id, reason=reason, duration_seconds=duration, purge_tasks=False):
+        info = db.get_ban_info(target_id) or {}
+        until_text = _fmt_until(info.get("until"))
+        await message.answer(f"✅ Пользователь <code>{target_id}</code> заблокирован до {until_text}.\nПричина: {reason}")
+        try:
+            await bot.send_message(
+                target_id,
+                "🚫 <b>Ваш аккаунт заблокирован!</b>\n\n"
+                f"<b>Причина:</b> {reason}\n"
+                f"<b>Срок:</b> {until_text}"
+            )
+        except:
+            pass
+    else:
+        await message.answer("❌ Не удалось заблокировать пользователя.")
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    """/unban <id>"""
+    manager_id = message.from_user.id
+    if not _is_admin_or_creator(manager_id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /unban <user_id>")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    if not db.can_unban_user(manager_id, target_id):
+        await message.answer("❌ У вас нет прав, чтобы разбанить этого пользователя.")
+        return
+
+    if db.unban_user(manager_id, target_id):
+        await message.answer(f"✅ Пользователь <code>{target_id}</code> разблокирован.")
+        try:
+            await bot.send_message(
+                target_id,
+                "✅ <b>Ваш аккаунт разблокирован!</b>\n\nТеперь вы снова можете использовать бота."
+            )
+        except:
+            pass
+    else:
+        await message.answer("❌ Пользователь не заблокирован или произошла ошибка.")
+
+@router.message(Command("bans"))
+async def cmd_bans(message: Message):
+    """Показать активные баны"""
+    manager_id = message.from_user.id
+    if not _is_admin_or_creator(manager_id):
+        return
+
+    banned_ids = sorted(list(db.ban_info.keys()))
+    if not banned_ids:
+        await message.answer("✅ Активных банов нет.")
+        return
+
+    lines = []
+    for uid in banned_ids[:30]:
+        info = db.get_ban_info(uid) or {}
+        reason = info.get("reason") or "Не указана"
+        until = info.get("until")
+        lines.append(f"• <code>{uid}</code> — {_fmt_until(until)} — {reason}")
+
+    more = ""
+    if len(banned_ids) > 30:
+        more = f"\n\n…и ещё {len(banned_ids) - 30} (смотрите в админ-панели → «Список банов»)"
+
+    await message.answer("🚫 <b>Активные баны:</b>\n" + "\n".join(lines) + more)
+
+@router.message(Command("warn"))
+async def cmd_warn(message: Message):
+    """/warn <id> [reason]"""
+    manager_id = message.from_user.id
+    if not _is_admin_or_creator(manager_id):
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Использование: /warn <user_id> [причина]")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    reason = parts[2].strip() if len(parts) >= 3 else ""
+    current = db.warn_user(manager_id, target_id, reason=reason)
+
+    await message.answer(
+        f"⚠️ Предупреждение выдано пользователю <code>{target_id}</code>.\n"
+        f"Текущее количество предупреждений: <b>{current}</b>\n"
+        f"(Лимит: {WARN_LIMIT}, после него — автобан на {AUTO_BAN_HOURS}ч)"
+    )
+
+@router.message(Command("clearwarn"))
+async def cmd_clearwarn(message: Message):
+    """/clearwarn <id>"""
+    manager_id = message.from_user.id
+    if not _is_admin_or_creator(manager_id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /clearwarn <user_id>")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    if db.clear_warnings(manager_id, target_id):
+        await message.answer(f"✅ Предупреждения для <code>{target_id}</code> сброшены.")
+    else:
+        await message.answer("❌ Не удалось сбросить предупреждения (возможно, нет прав).")
+
 
 @router.message(Command("tasks"))
 async def cmd_tasks(message: Message):
@@ -2080,6 +2560,106 @@ async def admin_list_admins_handler(callback: CallbackQuery):
         )
     )
 
+
+@router.callback_query(F.data == "admin_bans")
+async def admin_bans_handler(callback: CallbackQuery):
+    """Список текущих банов"""
+    if db.get_user_role(callback.from_user.id) not in ['admin', 'creator']:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+
+    banned_ids = sorted(list(db.ban_info.keys()))
+    if not banned_ids:
+        await callback.message.edit_text(
+            "✅ <b>Активных банов нет</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[
+                    InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")
+                ]]
+            )
+        )
+        return
+
+    await callback.message.edit_text(
+        f"🚫 <b>Заблокированные пользователи</b> (всего: {len(banned_ids)})\n\n"
+        "Нажмите на пользователя, чтобы посмотреть причину и срок бана.",
+        reply_markup=get_ban_list_keyboard(banned_ids, page=0)
+    )
+
+@router.callback_query(F.data.startswith("admin_bans_page_"))
+async def admin_bans_page(callback: CallbackQuery):
+    """Пагинация списка банов"""
+    if db.get_user_role(callback.from_user.id) not in ['admin', 'creator']:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+
+    try:
+        page = int(callback.data.split("_", 3)[3])
+    except:
+        page = 0
+
+    banned_ids = sorted(list(db.ban_info.keys()))
+    if not banned_ids:
+        await callback.message.edit_text(
+            "✅ <b>Активных банов нет</b>",
+            reply_markup=get_admin_keyboard(callback.from_user.id)
+        )
+        return
+
+    await callback.message.edit_text(
+        f"🚫 <b>Заблокированные пользователи</b> (всего: {len(banned_ids)})\n\n"
+        "Нажмите на пользователя, чтобы посмотреть причину и срок бана.",
+        reply_markup=get_ban_list_keyboard(banned_ids, page=page)
+    )
+
+@router.callback_query(F.data.startswith("admin_baninfo_"))
+async def admin_baninfo(callback: CallbackQuery):
+    """Информация о конкретном бане"""
+    if db.get_user_role(callback.from_user.id) not in ['admin', 'creator']:
+        await callback.answer("Доступ запрещен!", show_alert=True)
+        return
+
+    uid = int(callback.data.split("_", 2)[2])
+
+    if not db.is_banned(uid):
+        await callback.answer("Пользователь уже разблокирован.", show_alert=True)
+        await admin_bans_handler(callback)
+        return
+
+    info = db.get_ban_info(uid) or {}
+    reason = info.get("reason") or "Не указана"
+    by_id = info.get("by")
+    at = info.get("at")
+    until = info.get("until")
+    until_text = "бессрочно" if not until else until.strftime('%d.%m.%Y %H:%M')
+    at_text = at.strftime('%d.%m.%Y %H:%M') if at else "неизвестно"
+
+    user = db.users.get(uid, {})
+    username = user.get('username')
+    full_name = user.get('full_name')
+
+    by_user = db.users.get(by_id, {}) if by_id else {}
+    by_name = by_user.get('full_name') or (f"@{by_user.get('username')}" if by_user.get('username') else None)
+
+    text = (
+        "🚫 <b>Информация о бане</b>\n\n"
+        f"<b>Пользователь:</b> {full_name or 'Неизвестно'}\n"
+        f"<b>Username:</b> @{username if username else 'нет'}\n"
+        f"<b>ID:</b> <code>{uid}</code>\n\n"
+        f"<b>Причина:</b> {reason}\n"
+        f"<b>Забанил:</b> {by_name or (f'ID {by_id}' if by_id else 'неизвестно')}\n"
+        f"<b>Когда:</b> {at_text}\n"
+        f"<b>Срок:</b> {until_text}"
+    )
+
+    kb = InlineKeyboardBuilder()
+    if db.can_unban_user(callback.from_user.id, uid):
+        kb.add(InlineKeyboardButton(text="✅ Разбанить", callback_data=f"admin_unban_user_{uid}"))
+    kb.add(InlineKeyboardButton(text="🔙 Назад к списку банов", callback_data="admin_bans"))
+    kb.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+
 @router.callback_query(F.data == "admin_ban_user")
 async def admin_ban_user_start(callback: CallbackQuery, state: FSMContext):
     """Начало бана пользователя"""
@@ -2160,7 +2740,7 @@ async def process_ban_reason(message: Message, state: FSMContext):
     reason = message.text
     
     # Баним пользователя
-    if db.ban_user(target_id, reason):
+    if db.ban_user(manager_id, target_id, reason):
         user = db.users.get(target_id)
         
         await message.answer(
@@ -2199,7 +2779,7 @@ async def admin_ban_user_direct(callback: CallbackQuery):
         return
     
     # Баним пользователя
-    if db.ban_user(target_id, "Блокировка через админ-панель"):
+    if db.ban_user(user_id, target_id, "Блокировка через админ-панель"):
         user = db.users.get(target_id)
         
         await callback.message.edit_text(
@@ -2228,9 +2808,9 @@ async def admin_unban_user_start(callback: CallbackQuery, state: FSMContext):
     """Начало разбана пользователя"""
     user_id = callback.from_user.id
     
-    # Только создатель может разбанивать
-    if db.get_user_role(user_id) != 'creator':
-        await callback.answer("Только создатель может разбанивать пользователей!", show_alert=True)
+    # Только администраторы/создатель могут разбанивать
+    if db.get_user_role(user_id) not in ['admin', 'creator']:
+        await callback.answer("Доступ запрещен!", show_alert=True)
         return
     
     await callback.message.edit_text(
@@ -2250,26 +2830,35 @@ async def process_unban_user(message: Message, state: FSMContext):
     try:
         target_id = int(message.text)
         manager_id = message.from_user.id
-        
-        # Только создатель может разбанивать
-        if manager_id != CREATOR_ID:
+
+        if db.get_user_role(manager_id) not in ['admin', 'creator']:
             await message.answer(
-                "❌ Только создатель может разбанивать пользователей!",
+                "❌ Доступ запрещен!",
                 reply_markup=get_admin_keyboard(manager_id)
             )
             await state.clear()
             return
-        
+
+        # Проверяем права на конкретного пользователя
+        if not db.can_unban_user(manager_id, target_id):
+            await message.answer(
+                "❌ <b>У вас нет прав для разблокировки этого пользователя!</b>\n\n"
+                "Вы можете разблокировать только обычных пользователей.",
+                reply_markup=get_admin_keyboard(manager_id)
+            )
+            await state.clear()
+            return
+
         # Разбаниваем пользователя
-        if db.unban_user(target_id):
+        if db.unban_user(manager_id, target_id):
             user = db.users.get(target_id)
-            
+
             if user:
                 await message.answer(
                     f"✅ <b>Пользователь @{user.get('username', 'Без имени')} разблокирован!</b>",
                     reply_markup=get_admin_keyboard(manager_id)
                 )
-                
+
                 # Уведомляем пользователя
                 try:
                     await bot.send_message(
@@ -2289,7 +2878,7 @@ async def process_unban_user(message: Message, state: FSMContext):
                 "❌ Этот пользователь не был заблокирован или произошла ошибка.",
                 reply_markup=get_admin_keyboard(manager_id)
             )
-    
+
     except ValueError:
         await message.answer(
             "❌ Неверный формат ID. Введите числовой ID пользователя.",
@@ -2300,7 +2889,7 @@ async def process_unban_user(message: Message, state: FSMContext):
             )
         )
         return
-    
+
     await state.clear()
 
 @router.callback_query(F.data.startswith("admin_unban_user_"))
@@ -2309,13 +2898,13 @@ async def admin_unban_user_direct(callback: CallbackQuery):
     user_id = callback.from_user.id
     target_id = int(callback.data.split("_", 3)[3])
     
-    # Только создатель может разбанивать
-    if user_id != CREATOR_ID:
-        await callback.answer("Только создатель может разбанивать пользователей!", show_alert=True)
+    # Проверяем права на разбан
+    if db.get_user_role(user_id) not in ['admin', 'creator'] or not db.can_unban_user(user_id, target_id):
+        await callback.answer("У вас нет прав для разблокировки этого пользователя!", show_alert=True)
         return
     
     # Разбаниваем пользователя
-    if db.unban_user(target_id):
+    if db.unban_user(user_id, target_id):
         user = db.users.get(target_id)
         
         await callback.message.edit_text(
@@ -2530,6 +3119,15 @@ async def process_export(callback: CallbackQuery, state: FSMContext):
         "tasks": db.get_all_tasks(),
         "stats": db.admin_stats,
         "banned_users": list(db.banned_users),
+        "ban_info": {
+            str(uid): {
+                "reason": info.get("reason", ""),
+                "by": info.get("by"),
+                "at": info.get("at").isoformat() if info.get("at") else None,
+                "until": info.get("until").isoformat() if info.get("until") else None,
+            } for uid, info in db.ban_info.items()
+        },
+        "warnings": {str(uid): int(v) for uid, v in db.user_warnings.items()},
         "admins": db.get_all_admins(),
         "creator": CREATOR_ID,
         "export_date": datetime.now().isoformat()
@@ -2694,9 +3292,9 @@ async def cancel_creation(callback: CallbackQuery, state: FSMContext):
     )
 
 @router.callback_query(F.data == "create_task_from_empty")
-async def create_task_from_empty(callback: CallbackQuery):
+async def create_task_from_empty(callback: CallbackQuery, state: FSMContext):
     """Создать задачу из пустого списка"""
-    await create_task_start(callback.message, callback.state)
+    await create_task_start(callback.message, state)
 
 @router.callback_query(F.data == "create_another")
 async def create_another_task(callback: CallbackQuery, state: FSMContext):
