@@ -23,7 +23,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8278293381:AAHpnS4M6txEuChRjjLY_vgZUt6ey14NMhM"
+BOT_TOKEN = "8193091744:AAHjUopkLIBC5zuP4swtDkFKaFUeVqqnoEc"
 CREATOR_ID = 103161998
 ADMIN_IDS = {37607526, 103161998}  # Изначальные админы
 
