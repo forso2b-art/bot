@@ -23,8 +23,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8278293381:AAHpnS4M6txEuChRjjLY_vgZUt6ey14NMhM"
-ADMIN_IDS = {37607526, 103161998}
+BOT_TOKEN = "8193091744:AAHjUopkLIBC5zuP4swtDkFKaFUeVqqnoEc"
+ADMIN_IDS = {103161998}
 
 # ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
 logging.basicConfig(
