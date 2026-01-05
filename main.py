@@ -20,7 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8278293381:AAHpnS4M6txEuChRjjLY_vgZUt6ey14NMhM"
 ADMIN_IDS = {37607526, 103161998}
 
 # ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
