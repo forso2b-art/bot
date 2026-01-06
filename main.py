@@ -25,22 +25,27 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8414739699:AAGxLHowv9Pm893jBawx-DnbHnm8hMA3W34"
+BOT_TOKEN = "8414739699:..."
 CREATOR_ID = 103161998
 ADMIN_IDS = {37607526, 103161998}  # Изначальные админы
 
+# ====== ХРАНЕНИЕ ДАННЫХ (bothost-safe) ======
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # Файл для сохранения ролей/банов (переживает перезапуск)
-STATE_FILE = "bot_security_state.json"
+STATE_FILE = os.path.join(DATA_DIR, "bot_security_state.json")
 
 # Файл для сохранения данных (задачи/пользователи), чтобы прогресс переживал перезапуск
-DATA_FILE = "bot_data.json"
+DATA_FILE = os.path.join(DATA_DIR, "bot_data.json")
 
-# Поведение при бане: удалять ли задачи пользователя (оставлено True, чтобы не менять текущую логику)
+# Поведение при бане: удалять ли задачи пользователя
 PURGE_TASKS_ON_BAN = True
 
-# Предупреждения и автобан (новое)
+# Предупреждения и автобан
 WARN_LIMIT = 3
 AUTO_BAN_HOURS = 24
+
 
 
 # ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
