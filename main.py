@@ -32,6 +32,9 @@ ADMIN_IDS = {37607526, 103161998}  # Изначальные админы
 # Файл для сохранения ролей/банов (переживает перезапуск)
 STATE_FILE = "bot_security_state.json"
 
+# Файл для сохранения данных (задачи/пользователи), чтобы прогресс переживал перезапуск
+DATA_FILE = "bot_data.json"
+
 # Поведение при бане: удалять ли задачи пользователя (оставлено True, чтобы не менять текущую логику)
 PURGE_TASKS_ON_BAN = True
 
@@ -75,17 +78,39 @@ class Database:
         self.roles: Dict[int, str] = {}  # user_id -> role (creator/admin/user)
         self.banned_users: Set[int] = set()  # Забаненные пользователи (для быстрого подсчета/экспорта)
         self.ban_info: Dict[int, Dict] = {}  # user_id -> {reason, by, at, until}
-        self.user_warnings: Dict[int, int] = {}  # user_id -> warnings
-        self.ban_history: List[Dict] = []  # аудит банов/разбанов
+        self.user_warnings: Dict[int, int] = {}  # user_id -> warnings        self.ban_history: List[Dict] = []  # аудит банов/разбанов
         self.security_state_file = STATE_FILE
+        self.data_file = DATA_FILE
 
-        # Инициализация создателя (и подгрузка состояния)
+        # Инициализация создателя + подгрузка состояния безопасности и данных
         self.roles[CREATOR_ID] = 'creator'
         self._load_security_state()
+        self._load_data()
+
         # Страхуемся от "самобана" / переопределения роли создателя
         self.roles[CREATOR_ID] = 'creator'
         self.ban_info.pop(CREATOR_ID, None)
         self.banned_users.discard(CREATOR_ID)
+
+        # Создателя тоже держим в users (чтобы не терялся в экспорте/статистике)
+        if CREATOR_ID not in self.users:
+            self.users[CREATOR_ID] = {
+                'user_id': CREATOR_ID,
+                'username': 'creator',
+                'full_name': 'Создатель бота',
+                'joined': datetime.now(),
+                'task_count': 0,
+                'completed_count': 0,
+                'last_active': datetime.now(),
+                'warnings': 0
+            }
+
+        # Синхронизируем warnings из security-state в users
+        for uid, user in self.users.items():
+            user['warnings'] = int(self.user_warnings.get(uid, user.get('warnings', 0)))
+
+        self._rebuild_admin_stats()
+        self._save_data()
     
     def add_user(self, user_id: int, username: str, full_name: str):
         """Добавление пользователя с проверкой на бан"""
@@ -113,6 +138,8 @@ class Database:
             
             if datetime.now().date() == self.users[user_id]['joined'].date():
                 self.admin_stats['users_today'].add(user_id)
+
+            self._save_data()
         return True
     
     def get_user_role(self, user_id: int) -> str:
@@ -263,6 +290,7 @@ class Database:
             )
 
         self._save_security_state()
+        self._save_data()
         return self.user_warnings.get(target_id, 0)
 
     def clear_warnings(self, manager_id: int, target_id: int) -> bool:
@@ -273,6 +301,7 @@ class Database:
         if target_id in self.users:
             self.users[target_id]['warnings'] = 0
         self._save_security_state()
+        self._save_data()
         return True
 
     def _save_security_state(self) -> None:
@@ -324,6 +353,154 @@ class Database:
             self.user_warnings.update({int(k): int(v) for k, v in warnings.items()})
         except Exception as e:
             logger.exception(f"Failed to load security state: {e}")
+
+    # ====== ПЕРСИСТЕНТНОЕ ХРАНЕНИЕ ДАННЫХ (users/tasks) ======
+    def _dt_to_str(self, dt: Optional[datetime]) -> Optional[str]:
+        return dt.isoformat() if isinstance(dt, datetime) else None
+
+    def _str_to_dt(self, s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    def _save_data(self) -> None:
+        """Сохранение users/tasks/task_counter в JSON (переживает перезапуск)."""
+        try:
+            data = {
+                "task_counter": int(self.task_counter),
+                "users": [
+                    {
+                        **{k: v for k, v in u.items() if k not in ("joined", "last_active")},
+                        "joined": self._dt_to_str(u.get("joined")),
+                        "last_active": self._dt_to_str(u.get("last_active")),
+                    }
+                    for u in self.users.values()
+                ],
+                "tasks": [
+                    {
+                        **{k: v for k, v in t.items() if k not in ("created", "completed_at")},
+                        "created": self._dt_to_str(t.get("created")),
+                        "completed_at": self._dt_to_str(t.get("completed_at")),
+                    }
+                    for t in self.tasks.values()
+                ],
+                "saved_at": datetime.now().isoformat(),
+            }
+
+            tmp = self.data_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.data_file)
+        except Exception as e:
+            logger.exception(f"Failed to save data state: {e}")
+
+    def _load_data(self) -> None:
+        """Загрузка users/tasks/task_counter из JSON."""
+        try:
+            if not os.path.exists(self.data_file):
+                return
+
+            with open(self.data_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # users
+            users: Dict[int, Dict] = {}
+            for u in data.get("users", []) or []:
+                if not isinstance(u, dict):
+                    continue
+                uid_raw = u.get("user_id")
+                if uid_raw is None:
+                    continue
+                uid = int(uid_raw)
+                u2 = dict(u)
+                u2["user_id"] = uid
+                u2["joined"] = self._str_to_dt(u.get("joined")) or datetime.now()
+                u2["last_active"] = self._str_to_dt(u.get("last_active")) or u2["joined"]
+                u2["warnings"] = int(u2.get("warnings", 0))
+                u2["task_count"] = int(u2.get("task_count", 0))
+                u2["completed_count"] = int(u2.get("completed_count", 0))
+                users[uid] = u2
+            self.users = users
+
+            # tasks
+            tasks: Dict[int, Dict] = {}
+            max_task_id = 0
+            for t in data.get("tasks", []) or []:
+                if not isinstance(t, dict):
+                    continue
+                tid_raw = t.get("id")
+                if tid_raw is None:
+                    continue
+                tid = int(tid_raw)
+                if tid <= 0:
+                    continue
+                t2 = dict(t)
+                t2["id"] = tid
+                t2["user_id"] = int(t2.get("user_id", 0))
+                t2["text"] = str(t2.get("text", ""))
+                t2["category"] = str(t2.get("category", "Общее"))
+                t2["priority"] = str(t2.get("priority", "medium"))
+                t2["created"] = self._str_to_dt(t.get("created")) or datetime.now()
+                t2["completed"] = bool(t2.get("completed", False))
+                t2["completed_at"] = self._str_to_dt(t.get("completed_at"))
+                tasks[tid] = t2
+                max_task_id = max(max_task_id, tid)
+            self.tasks = tasks
+
+            self.task_counter = int(data.get("task_counter", max_task_id) or max_task_id)
+            if self.task_counter < max_task_id:
+                self.task_counter = max_task_id
+        except Exception as e:
+            logger.exception(f"Failed to load data state: {e}")
+
+    def _rebuild_admin_stats(self) -> None:
+        """Пересчет статистики по данным (на случай перезапуска/битых счетчиков)."""
+        # Сбрасываем счетчики у пользователей, затем считаем по tasks
+        for u in self.users.values():
+            u["task_count"] = 0
+            u["completed_count"] = 0
+
+        total_tasks = 0
+        completed_tasks = 0
+        active_users: Set[int] = set()
+
+        today = datetime.now().date()
+        tasks_today = 0
+
+        for t in self.tasks.values():
+            total_tasks += 1
+            if t.get("completed"):
+                completed_tasks += 1
+
+            uid = int(t.get("user_id", 0))
+            active_users.add(uid)
+
+            if uid in self.users:
+                self.users[uid]["task_count"] += 1
+                if t.get("completed"):
+                    self.users[uid]["completed_count"] += 1
+
+            created = t.get("created")
+            if isinstance(created, datetime) and created.date() == today:
+                tasks_today += 1
+
+        users_today: Set[int] = set()
+        for uid, u in self.users.items():
+            joined = u.get("joined")
+            if isinstance(joined, datetime) and joined.date() == today:
+                users_today.add(uid)
+
+        self.admin_stats = {
+            "total_tasks": total_tasks,
+            "completed_tasks": completed_tasks,
+            "active_users": active_users,
+            "tasks_today": tasks_today,
+            "users_today": users_today,
+        }
+
 
 
     def set_admin(self, user_id: int) -> bool:
@@ -430,6 +607,7 @@ class Database:
         if datetime.now().date() == self.tasks[self.task_counter]['created'].date():
             self.admin_stats['tasks_today'] += 1
         
+        self._save_data()
         return self.task_counter
     
     def get_user_tasks(self, user_id: int, completed: Optional[bool] = None) -> List[Dict]:
@@ -466,6 +644,7 @@ class Database:
             elif not task['completed'] and was_completed:
                 self.admin_stats['completed_tasks'] -= 1
             
+            self._save_data()
             return True
         return False
     
@@ -482,6 +661,7 @@ class Database:
             self.admin_stats['total_tasks'] -= 1
             if task['completed']:
                 self.admin_stats['completed_tasks'] -= 1
+            self._save_data()
             return True
         return False
     
@@ -495,6 +675,7 @@ class Database:
         task = self.tasks.get(task_id)
         if task and not self.is_banned(task['user_id']):
             task['priority'] = priority
+            self._save_data()
             return True
         return False
     
@@ -502,6 +683,7 @@ class Database:
         task = self.tasks.get(task_id)
         if task and not self.is_banned(task['user_id']):
             task['category'] = category
+            self._save_data()
             return True
         return False
     
@@ -509,6 +691,7 @@ class Database:
         task = self.tasks.get(task_id)
         if task and not self.is_banned(task['user_id']):
             task['text'] = text
+            self._save_data()
             return True
         return False
     
